@@ -504,6 +504,7 @@ class AcpRuntime:
         model: str | None = None,
         expect_mcp_reports: bool = True,
         acp_backend: str = ACP_BACKEND_KIRO,
+        crew_agent: str = "",
     ):
         if work_dir:
             self._work_dir = Path(work_dir)
@@ -514,6 +515,12 @@ class AcpRuntime:
 
             self._work_dir = config_dir() / "workspace"
         self._agent = agent
+        # Canonical Kiro Crew agent identity (a cfg.agents key) resolved by the
+        # surface that created this runtime — a DIFFERENT namespace from
+        # ``agent`` (the kiro template the process spawns with). Default for
+        # sessions created on this runtime; a warm-pool rekey overwrites it so
+        # later sessions inherit the claiming crew, not the pool's spawn state.
+        self._crew_agent = crew_agent
         self._acp_backend = acp_backend
         if model is not None:
             if not MODEL_ID_RE.match(model):
@@ -1509,8 +1516,13 @@ class AcpRuntime:
         cwd: str | Path | None = None,
         agent: str | None = None,
         mcp_servers: list[dict[str, Any]] | None = None,
+        crew_agent: str | None = None,
     ) -> AcpSessionHandle:
-        """Create a new ACP session on this runtime. Returns a session handle."""
+        """Create a new ACP session on this runtime. Returns a session handle.
+
+        ``crew_agent`` is the canonical Kiro Crew identity for THIS session;
+        None falls back to the runtime's own (spawn-time or rekeyed) identity.
+        """
         if not self._initialized:
             raise AcpRuntimeError("Runtime not initialized — call spawn() first")
 
@@ -1551,6 +1563,11 @@ class AcpRuntime:
             session_id=session_id,
             queue=queue,
             runtime=self,
+            agent=agent or self._agent or "",
+            # Canonical crew identity keys the handle's per-agent
+            # watchdog-window overrides; the kiro ``agent`` name above is a
+            # different namespace, kept for logs/row-store joins only.
+            crew_agent=crew_agent if crew_agent is not None else self._crew_agent,
         )
 
         # Populate state from session/new response (configOptions, available models)
@@ -1621,6 +1638,7 @@ class AcpRuntime:
         resume_sid: str,
         cwd: str | Path | None = None,
         agent: str | None = None,
+        crew_agent: str | None = None,
     ) -> AcpSessionHandle:
         """Resume a prior session via session/load — mirrors AcpClient.
 
@@ -1687,6 +1705,10 @@ class AcpRuntime:
             session_id=resume_sid,
             queue=queue,
             runtime=self,
+            agent=agent or self._agent or "",
+            # Mirrors create_session: a resumed session gets the same
+            # canonical-crew watchdog-window overrides as a fresh one.
+            crew_agent=crew_agent if crew_agent is not None else self._crew_agent,
         )
         handle.store_session_config(resp)
 

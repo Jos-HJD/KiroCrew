@@ -670,6 +670,23 @@ class TestAcpSessionProviderRound4Parity:
         assert provider._channel_id == "chan-7"
         assert runtime._last_activity > 0.0
 
+    def test_rekey_rebinds_watchdog_to_claiming_crew(self):
+        """The claiming session's canonical crew identity travels with the
+        claim: rekey rebinds the live handle's watchdog snapshot AND updates
+        the runtime default so later sessions (new_conversation) inherit the
+        claimed crew, not the pool's spawn state."""
+        handle = _make_handle()
+        runtime = _make_runtime()
+        provider = AcpSessionProvider(handle, runtime)
+        provider.rekey("dashboard:slot9", "chan-7", crew_agent="pr-reviewer")
+        handle.rebind_watchdog.assert_called_once_with("pr-reviewer")
+        assert runtime._crew_agent == "pr-reviewer"
+        # An identity-less claim still rebinds (to the globals): a recycled
+        # runtime must not carry a previous crew's windows.
+        provider.rekey("dashboard:slot3", None)
+        handle.rebind_watchdog.assert_called_with("")
+        assert runtime._crew_agent == ""
+
     def test_rekey_resets_context_state(self):
         """#2932 -- the handoff must drop the previous session's context state
         (mirror of AcpClient.rekey): _make_handle seeds pct=42/5000/200000, so

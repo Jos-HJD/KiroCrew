@@ -2649,7 +2649,17 @@ class SessionManager:
                 )
 
                 if isinstance(provider, AcpProvider):
-                    provider.client.rekey(key, channel_id)
+                    # The claiming session's canonical crew identity travels
+                    # with the claim: a kiro-shared client rebinds the handle's
+                    # per-agent watchdog windows; the AcpClient path stores it
+                    # inert. Pool claims are default-agent-only, so the caller-
+                    # supplied kwarg (the dashboard slot member) is the only
+                    # possible source — no config lookup needed here.
+                    provider.client.rekey(
+                        key,
+                        channel_id,
+                        crew_agent=str(extra_factory_kwargs.get("crew_agent") or ""),
+                    )
                     # Switch model post-claim if caller requested non-default.
                     if model:
                         _pool_model = (

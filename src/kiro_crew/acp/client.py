@@ -1900,6 +1900,9 @@ class AcpClient:
         # the backend default.
         self._permission_mode = permission_mode
         self._session_key = session_key
+        # Canonical crew identity, set by rekey() for interface parity with
+        # AcpSessionProvider — inert on this dispatch path (see rekey).
+        self._crew_agent: str = ""
         # When set, this client emits a per-tool-call SEL audit from the ACP
         # dispatch loop. Used by app/worker-pool clients (e.g. code-review-sage,
         # knowledge llm_pool) that have no external audit loop. Left None for
@@ -2135,10 +2138,18 @@ class AcpClient:
         """Set a kiro-cli session ID to restore via session/load on next ensure_ready()."""
         self._resume_session_id = sid
 
-    def rekey(self, session_key: str, channel_id: str | None = None) -> None:
-        """Re-key this client for a different session (used by warm pool)."""
+    def rekey(
+        self, session_key: str, channel_id: str | None = None, crew_agent: str = ""
+    ) -> None:
+        """Re-key this client for a different session (used by warm pool).
+
+        ``crew_agent`` exists for signature parity with AcpSessionProvider.rekey
+        (session.py calls provider.client.rekey uniformly): this client's own
+        dispatch loop carries no per-agent watchdog snapshot, so the identity is
+        stored but drives nothing here."""
         self._session_key = session_key
         self._channel_id = channel_id
+        self._crew_agent = crew_agent
         self._last_activity = time.monotonic()
         # The prompt stats' context fields describe whatever this runtime did
         # BEFORE the handoff — carry_over() deliberately preserves them across

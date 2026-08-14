@@ -30,7 +30,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.executors import subprocess_executor
@@ -915,6 +915,14 @@ def _fallback_log_path() -> Path:
     return _crew_home() / "logs" / "stub_fallback.jsonl"
 
 
+# Rotate the fallback log once it exceeds this size, keeping ONE previous
+# generation (``.jsonl.1``). The log grew unbounded before (467 KB in 15 h on
+# one degraded host, issue #3495); a 1 MiB cap bounds total disk use at ~2 MiB
+# while keeping enough history for the gateway's per-server fallback-rate
+# aggregation (see ``gatewayd`` stats).
+_FALLBACK_LOG_MAX_BYTES = 1024 * 1024
+
+
 def log_fallback(
     reason: str, stub_uuid: str, pool_label: str, args: argparse.Namespace
 ) -> None:
@@ -924,6 +932,15 @@ def log_fallback(
     try:
         log_path = _fallback_log_path()
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if log_path.stat().st_size >= _FALLBACK_LOG_MAX_BYTES:
+                # One-generation rotation. os.replace is atomic; a concurrent
+                # stub appending to the old inode finishes its write there —
+                # one record landing in the rotated file is acceptable for an
+                # audit log, losing the append is not.
+                os.replace(log_path, log_path.with_suffix(".jsonl.1"))
+        except OSError:
+            pass  # missing file (fresh boot) or a racing rotation — append anyway
         record = {
             "ts": time.time(),
             "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -940,6 +957,54 @@ def log_fallback(
             f.write(json.dumps(record, separators=(",", ":")) + "\n")
     except OSError:
         pass
+
+
+def fallback_counts(window_secs: float = 24 * 3600.0) -> dict[str, Any]:
+    """Aggregate the fallback audit log into per-server counts.
+
+    Reads the live log plus the one rotated generation (see
+    ``_FALLBACK_LOG_MAX_BYTES``) and counts records whose ``ts`` falls within
+    the last ``window_secs``. This is the reader the log never had (issue
+    #3495): 988 degradations accrued with no signal anywhere. gatewayd folds
+    the result into its ``stats`` reply so the dashboard's gateway health
+    surface shows a per-server fallback count instead of the operator having
+    to read a process tree.
+
+    Returns ``{"window_secs": ..., "total": n, "by_server": {name: n},
+    "by_reason": {reason: n}}``. Never raises — an unreadable or torn log
+    yields the counts of whatever parsed.
+    """
+    cutoff = time.time() - window_secs
+    total = 0
+    by_server: dict[str, int] = {}
+    by_reason: dict[str, int] = {}
+    live = _fallback_log_path()
+    for path in (live.with_suffix(".jsonl.1"), live):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue  # torn tail line from a racing writer
+                    if not isinstance(rec, dict):
+                        continue
+                    ts = rec.get("ts")
+                    if not isinstance(ts, (int, float)) or ts < cutoff:
+                        continue
+                    total += 1
+                    server = str(rec.get("server") or rec.get("pool_label") or "?")
+                    by_server[server] = by_server.get(server, 0) + 1
+                    reason = str(rec.get("reason") or "?")
+                    by_reason[reason] = by_reason.get(reason, 0) + 1
+        except OSError:
+            continue
+    return {
+        "window_secs": window_secs,
+        "total": total,
+        "by_server": by_server,
+        "by_reason": by_reason,
+    }
 
 
 def fallback_exec(args: argparse.Namespace) -> None:

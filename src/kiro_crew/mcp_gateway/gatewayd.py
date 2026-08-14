@@ -213,6 +213,41 @@ TargetResolver = Callable[
 # --- Public API -------------------------------------------------------------
 
 
+# (size, mtime_ns) of the live fallback log at the last aggregation, plus the
+# aggregated payload. The log is append-only between rotations, so an
+# unchanged stat means an identical aggregation — stats polls (dashboard
+# cadence) then skip re-parsing up to ~2 MiB of JSONL per poll.
+_fallback_stats_cache: tuple[tuple[int, int], dict[str, Any]] | None = None
+
+
+def _fallback_counts_cached() -> dict[str, Any]:
+    """Per-server stub-fallback counts for the stats reply (issue #3495).
+
+    Delegates to :func:`kiro_crew.mcp_gateway.stub.fallback_counts` — the
+    module that owns the log's path and format — and caches on the live
+    file's (size, mtime): the aggregation is a pure function of file content
+    for a fixed window, and a few minutes of window drift between appends is
+    irrelevant for a health counter. Never raises.
+    """
+    global _fallback_stats_cache
+    from kiro_crew.mcp_gateway.stub import _fallback_log_path, fallback_counts
+
+    try:
+        st = _fallback_log_path().stat()
+        sig = (st.st_size, st.st_mtime_ns)
+    except OSError:
+        sig = (0, 0)  # no log yet — cacheable as "empty"
+    if _fallback_stats_cache is not None and _fallback_stats_cache[0] == sig:
+        return _fallback_stats_cache[1]
+    try:
+        counts = fallback_counts()
+    except Exception:  # pragma: no cover — reader is best-effort by contract
+        logger.debug("stub-fallback aggregation failed", exc_info=True)
+        return {"window_secs": 0, "total": 0, "by_server": {}, "by_reason": {}}
+    _fallback_stats_cache = (sig, counts)
+    return counts
+
+
 def _default_cli_socket_path() -> Path:
     """Fallback socket path for the CLI's ``--socket`` argparse default.
 
@@ -1947,6 +1982,7 @@ async def _handle_connection(
         snapshot = await pool.metrics_snapshot_async()
         if hot_keys is not None:
             snapshot.update(hot_keys.hit_stats())
+        snapshot["stub_fallbacks"] = _fallback_counts_cached()
         await _write_json_line(writer, {"type": "stats", **snapshot})
         return
 

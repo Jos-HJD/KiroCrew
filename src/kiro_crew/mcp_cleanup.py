@@ -39,9 +39,26 @@ def _kiro_mcp_json() -> Path:
 
 # Managed servers whose command is the kirocrew binary itself.
 # Only these are affected by install-method path changes.
-# Ordered tuple (not a set) so consumers that iterate — e.g. `kirocrew
+# Ordered tuples (not sets) so consumers that iterate — e.g. `kirocrew
 # doctor`'s MCP probe — get a deterministic order.
-KIROCREW_BIN_MCP_SERVERS = ("kirocrew-cron", "kirocrew-core", "kirocrew-computer")
+#
+# The split matters to every consumer that asks "should this server be in the
+# spec?". An ALWAYS_ON server missing from an agent spec is a broken install; an
+# OPT_IN one is an assignable set that most agents are simply not granted, so
+# demanding its presence — or minting an auto-approve grant for it — would undo
+# the assignment. Membership here must track the ``opt_in`` flags in
+# ``agent._MANAGED_MCP_SERVERS``; a ratchet test pins the two together.
+ALWAYS_ON_BIN_MCP_SERVERS = (
+    "kirocrew-cron",
+    "kirocrew-core",
+    "kirocrew-computer",
+)
+OPT_IN_BIN_MCP_SERVERS = ("kirocrew-dashboard",)
+
+# Every managed-binary server name, regardless of how it reaches a spec. This is
+# the cleanup view: Kiro Crew never legitimately writes any of them into the
+# user's global mcp.json, so a stray entry is purgeable either way.
+KIROCREW_BIN_MCP_SERVERS = ALWAYS_ON_BIN_MCP_SERVERS + OPT_IN_BIN_MCP_SERVERS
 
 # MeshClaw was the predecessor of KiroCrew. The rename left these managed
 # server entries — pointing at now-dead MeshClaw build paths — behind in the
@@ -49,8 +66,14 @@ KIROCREW_BIN_MCP_SERVERS = ("kirocrew-cron", "kirocrew-core", "kirocrew-computer
 PREDECESSOR_BIN_MCP_SERVERS = frozenset({"meshclaw-cron", "meshclaw-core"})
 
 # Every managed-binary server name KiroCrew is responsible for removing from
-# the user's global mcp.json (KiroCrew never legitimately writes these there).
-STALE_MANAGED_MCP_SERVERS = frozenset(KIROCREW_BIN_MCP_SERVERS) | PREDECESSOR_BIN_MCP_SERVERS
+# the user's global mcp.json (Kiro Crew never legitimately writes these there).
+#
+# ALWAYS_ON only, deliberately. An opt-in set is granted by hand, so a global
+# entry under that name may well be the user's own — theirs to keep, not ours to
+# purge. It is removed only when the entry itself proves Kiro Crew wrote it (see
+# ``_invokes_managed_subcommand``), which keeps the name from being the whole
+# test.
+STALE_MANAGED_MCP_SERVERS = frozenset(ALWAYS_ON_BIN_MCP_SERVERS) | PREDECESSOR_BIN_MCP_SERVERS
 
 
 # The argv token the deleted Playwright MCP proxy was registered with. An entry
@@ -75,6 +98,40 @@ def _invokes_deleted_playwright_proxy(spec: object) -> bool:
     if not isinstance(args, list):
         return False
     return any(isinstance(a, str) and a == _DELETED_PROXY_ARGV_TOKEN for a in args)
+
+
+def _invokes_managed_subcommand(name: str, spec: object) -> bool:
+    """True if *spec* is an entry Kiro Crew itself would have written for *name*.
+
+    The ownership test for an OPT-IN server, whose name alone proves nothing: a
+    global ``kirocrew-dashboard`` may be the user's own hand-written entry, and
+    deleting that would be destroying their config.
+
+    Ours is recognisable by the WHOLE invocation, and both halves are required —
+    the subcommand in argv AND a command that is one of the two forms Kiro Crew
+    emits (the ``kirocrew`` console script, or an interpreter running
+    ``-m kiro_crew``). Matching argv alone would claim a user's
+    ``node mcp-dashboard`` as ours and delete it.
+    """
+    if not isinstance(spec, dict):
+        return False
+    _, _, suffix = name.partition("-")
+    if not suffix:
+        return False
+    args = [a for a in (spec.get("args") or []) if isinstance(a, str)]
+    if f"mcp-{suffix}" not in args:
+        return False
+    cmd = spec.get("command")
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    # Split on BOTH separators for the same reason ``_invokes_meshclaw`` does:
+    # mcp.json is cross-platform data, and os.path.basename only honors the
+    # host's separator, so a config written on Windows would not match here.
+    stem = cmd.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if stem in {"kirocrew", "kirocrew.exe"}:
+        return True
+    # The module form: any interpreter, but it must actually run our package.
+    return "-m" in args and "kiro_crew" in args
 
 
 def _invokes_meshclaw(spec: object) -> bool:
@@ -134,6 +191,7 @@ def clean_stale_managed_mcp() -> list[str]:
         name
         for name, spec in servers.items()
         if name in STALE_MANAGED_MCP_SERVERS
+        or (name in OPT_IN_BIN_MCP_SERVERS and _invokes_managed_subcommand(name, spec))
         or _invokes_meshclaw(spec)
         or _invokes_deleted_playwright_proxy(spec)
     )

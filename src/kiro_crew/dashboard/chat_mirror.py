@@ -524,7 +524,7 @@ async def api_chat_slot_mirror_unlink(request: web.Request) -> web.Response:
         return web.json_response({"error": "not found"}, status=404)
 
     session_key = effective_session_key(slot)
-    cleared = state.sessions.clear_mirror_link(session_key)
+    cleared = state.sessions.clear_mirror_link(session_key, reason="dashboard_unlink")
     state.push_slots_update()
     sel().log_api_access(
         caller="dashboard",

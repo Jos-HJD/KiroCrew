@@ -1391,11 +1391,17 @@ class TelegramDispatcher:
         # for what is one user-visible action.
         with self.sessions.batched_save():
             self.sessions.set_mirror_opt_out(key, False)
-            self.sessions.set_mirror_link(key, self._origin_mirror_link(route, chat_id))
+            self.sessions.set_mirror_link(
+                key,
+                self._origin_mirror_link(route, chat_id),
+                reason="origin_rebind",
+            )
             # Drop any pre-unification row so a stale binding cannot outlive the
             # rebind (reads prefer the channel key, but a leftover row would still
             # answer a clear).
-            self.sessions.clear_mirror_link(legacy_dashboard_mirror_key(key))
+            self.sessions.clear_mirror_link(
+                legacy_dashboard_mirror_key(key), reason="origin_rebind"
+            )
         await self._reply(
             chat_id,
             "✅ Linked. Replies from the dashboard for this conversation will "

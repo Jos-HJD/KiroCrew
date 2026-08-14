@@ -110,6 +110,7 @@ from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.executors import maintenance_executor, subprocess_executor
 from kiro_crew.mcp_gateway.abort import schedule_abort
 from kiro_crew.messaging.link import (
+    UNBIND_REASON_UNSPECIFIED,
     ChannelLink,
     canonical_key,
     legacy_key,
@@ -122,6 +123,7 @@ from kiro_crew.sel import sel
 from kiro_crew.session_map import _kiro_sessions_dir  # noqa: F401
 from kiro_crew.session_map import MIRROR_OPT_OUT_FLAG
 from kiro_crew.session_map import SessionMap as SessionMap  # noqa: F401
+from kiro_crew.session_map import UnbindListener, set_unbind_listener
 from kiro_crew.session_pid import (
     _build_child_map,
     _cleanup_orphaned_mcp_servers,
@@ -3362,7 +3364,7 @@ class SessionManager:
                 await session.provider.shutdown()
                 logger.info("Recycled session %s (context overflow; entry already replaced)", key)
             else:
-                self._session_map.delete(key)
+                self._session_map.delete(key, reason="session_recycled")
                 await popped.provider.shutdown()
                 logger.info("Recycled session %s (context overflow)", key)
             await self._fire_compact_callback(key, pct, success=True)
@@ -3573,7 +3575,7 @@ class SessionManager:
             # Reap any companion subagent runtime keyed by this parent (see remove()).
             await self.release_subagent_runtime(key)
         finally:
-            self._session_map.delete(key)
+            self._session_map.delete(key, reason="session_destroyed")
             logger.info("Destroyed session (map deleted): %s", key)
 
     async def discard_conversation(self, key: str) -> None:
@@ -4238,17 +4240,20 @@ class SessionManager:
         link: ChannelLink | None,
         *,
         accepts_inbound: bool = False,
+        reason: str = UNBIND_REASON_UNSPECIFIED,
     ) -> None:
         """Bind (or clear) a session's channel-neutral mirror target.
 
         ``accepts_inbound`` upgrades a non-Slack outbound mirror into a
         persisted session-resume binding. Slack owns its dedicated reverse
-        index; other channels use :meth:`find_mirror_sessions`.
+        index; other channels use :meth:`find_mirror_sessions`. ``reason`` is
+        recorded when this call ends an existing inbound binding.
         """
         self._session_map.set_mirror_link(
             key,
             link,
             accepts_inbound=accepts_inbound,
+            reason=reason,
         )
 
     def get_mirror_link(self, key: str) -> ChannelLink | None:
@@ -4370,13 +4375,24 @@ class SessionManager:
         """Sessions that must stop *key* from binding *link*, or [] if it is free."""
         return self._session_map.mirror_claim_blockers(key, link, accepts_inbound=accepts_inbound)
 
-    def clear_mirror_link(self, key: str) -> bool:
+    def clear_mirror_link(self, key: str, *, reason: str = UNBIND_REASON_UNSPECIFIED) -> bool:
         """Remove a session's outbound mirror binding. Returns True iff present."""
-        return self._session_map.clear_mirror_link(key)
+        return self._session_map.clear_mirror_link(key, reason=reason)
 
-    def clear_mirror_links_at(self, link: ChannelLink) -> list[str]:
+    def clear_mirror_links_at(
+        self, link: ChannelLink, *, reason: str = UNBIND_REASON_UNSPECIFIED
+    ) -> list[str]:
         """Clear every session mirroring to an exact location; return cleared keys."""
-        return self._session_map.clear_mirror_links_at(link)
+        return self._session_map.clear_mirror_links_at(link, reason=reason)
+
+    @staticmethod
+    def set_unbind_listener(callback: UnbindListener | None) -> None:
+        """Register the sink notified when an inbound resume binding is removed.
+
+        The registry it writes is the session map's, shared by every instance, so
+        a removal performed through a throwaway map is announced too.
+        """
+        set_unbind_listener(callback)
 
     # Backward-compat aliases used by callers not yet migrated
     async def set_channel(self, key: str, channel_id: str) -> None:

@@ -23,11 +23,13 @@ from kiro_crew.acp.types import PROVIDER_LABEL_DEFAULT
 from kiro_crew.config.paths import config_dir, kiro_sessions_dir
 from kiro_crew.messaging.link import (
     SLACK_NAMESPACE,
+    UNBIND_REASON_UNSPECIFIED,
     ChannelLink,
     canonical_key,
     is_channel_session_key,
     legacy_dashboard_mirror_key,
 )
+from kiro_crew.sel import _infer_source, sel
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +82,36 @@ def _has_durable_flag(entry: dict) -> bool:
     if not isinstance(flags, dict):
         return False
     return any(flags.get(name) for name in _DURABLE_FLAGS)
+
+
+# The callable shape a lost-binding announcement is delivered through:
+# ``(session_key, link, reason)``.
+UnbindListener = Callable[[str, ChannelLink, str], None]
+
+# Announces a lost inbound binding to the channel that lost it. Registered by the
+# gateway, because reaching a channel means resolving a transport and SessionMap
+# is the synchronous store every surface sits on — importing transports here
+# would invert that. MODULE-level for the same reason as :data:`_MAP_LOCK`: a
+# clearing call site may hold a throwaway ``SessionMap()`` rather than the
+# manager's, and a per-instance listener would leave those removals unannounced.
+_UNBIND_LISTENER: UnbindListener | None = None
+
+
+def set_unbind_listener(callback: UnbindListener | None) -> None:
+    """Register (or clear, with None) the sink for inbound-binding removals.
+
+    Invoked as ``callback(session_key, link, reason)`` after the binding is gone
+    and persisted, so the callback observes a committed removal rather than an
+    intention. Best-effort by contract: the callback is called inside the map
+    lock on a synchronous path, so it must not block, and an exception it raises
+    is swallowed — a broken notifier cannot fail the unlink that provoked it.
+
+    Suppression by reason belongs to the callback: the map audits every removal
+    unconditionally, and only the callback knows whether the user has already
+    been told in the conversation.
+    """
+    global _UNBIND_LISTENER
+    _UNBIND_LISTENER = callback
 
 
 # Serializes every structural access to the map. MODULE-level, not per-instance,
@@ -690,15 +722,78 @@ class SessionMap:
         """
         return self._resolve_alias(key)[1] is not None
 
+    @staticmethod
+    def _inbound_binding(entry: dict) -> ChannelLink | None:
+        """The inbound resume binding *entry* holds, or None when it holds none.
+
+        The single definition of "losing this strands a conversation", so every
+        removal path announces the same thing. An entry flagged inbound whose
+        ``mirror`` is missing or unparsable routes nothing already, so it is not
+        a loss.
+        """
+        if not entry.get("mirror_accepts_inbound"):
+            return None
+        raw = entry.get("mirror")
+        if not isinstance(raw, dict):
+            return None
+        try:
+            return ChannelLink.from_dict(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _note_inbound_unbind(self, key: str, link: ChannelLink, reason: str) -> None:
+        """Audit and announce the removal of one inbound resume binding.
+
+        The choke point every removal path funnels through, so a binding cannot
+        die traceless: the SEL event is the durable record (lifecycle logs are
+        INFO and a production gateway logs WARNING and above), and the listener
+        is what reaches the channel that just lost its way back.
+
+        Called after the removal is persisted, so the audit describes something
+        that happened. Both legs are best-effort: a broken audit sink or notifier
+        must not turn an unlink — or a session teardown, which reaches here from a
+        ``finally`` — into a raised exception.
+        """
+        target = f"{link.channel_type}:{link.channel_id or ''}"
+        if link.thread_id:
+            target = f"{target}/{link.thread_id}"
+        try:
+            sel().log_api_access(
+                caller="kirocrew",
+                operation="session.inbound_unbind",
+                outcome="success",
+                # ``_infer_source`` is the canonical key->surface classifier, so
+                # this event's surface cannot drift from the rest of the trail.
+                source=_infer_source(key),
+                resources=f"{key} -> {target} ({reason})",
+            )
+        except Exception:
+            logger.debug("inbound-unbind audit failed for %s", key, exc_info=True)
+        listener = _UNBIND_LISTENER
+        if listener is None:
+            return
+        try:
+            listener(key, link, reason)
+        except Exception:
+            logger.debug("inbound-unbind listener failed for %s", key, exc_info=True)
+
     @_guarded
-    def _remove_entry(self, key: str) -> None:
-        """Remove an entry and update reverse index."""
+    def _remove_entry(self, key: str, *, reason: str = UNBIND_REASON_UNSPECIFIED) -> None:
+        """Remove an entry and update reverse index.
+
+        A dying entry takes any inbound binding it held with it, so the removal
+        is announced here rather than at each caller — this is the only path by
+        which a whole entry leaves the map.
+        """
         entry = self._data.pop(key, None)
         if entry:
+            inbound = self._inbound_binding(entry)
             ts = entry.get("slack_thread_ts")
             if ts and self._thread_to_session.get(ts) == key:
                 del self._thread_to_session[ts]
             self._save()
+            if inbound is not None:
+                self._note_inbound_unbind(key, inbound, reason)
 
     @_guarded
     def set(self, key: str, sid: str, *, provider: str = "", cwd: str = "") -> None:
@@ -758,9 +853,14 @@ class SessionMap:
         return entry.get("discarded_sid", "")
 
     @_guarded
-    def delete(self, key: str) -> None:
-        """Remove mapping and persist."""
-        self._remove_entry(canonical_key(key))
+    def delete(self, key: str, *, reason: str = "entry_deleted") -> None:
+        """Remove mapping and persist.
+
+        The catch-all reason names the shape of the removal rather than its
+        motive: a caller that knows why (a session teardown, a recycle) passes
+        its own so the audit says which one happened.
+        """
+        self._remove_entry(canonical_key(key), reason=reason)
 
     @_guarded
     def prune(self) -> int:
@@ -785,6 +885,7 @@ class SessionMap:
         """
         sessions_dir = _kiro_sessions_dir()
         stale: list[str] = []
+        pruned_inbound: list[tuple[str, ChannelLink]] = []
         repaired = False
         for key, entry in self._data.items():
             # Only kiro-cli's transcripts are stat-able here; other backends
@@ -807,7 +908,14 @@ class SessionMap:
             ):
                 stale.append(key)
         for k in stale:
+            # Captured before the delete: a pruned entry can be carrying an
+            # inbound binding (its native transcript is gone, the binding is
+            # not), and the conversation is owed the same notice as an explicit
+            # unlink. Announced after the write so it reports a committed state.
+            lost = self._inbound_binding(self._data[k])
             del self._data[k]
+            if lost is not None:
+                pruned_inbound.append((k, lost))
         if stale:
             self._rebuild_thread_index()
             self._save()
@@ -816,6 +924,8 @@ class SessionMap:
             # A sid-only reset still has to reach disk, or the next startup sees
             # the same stale sid and repairs it again forever.
             self._save()
+        for key, lost in pruned_inbound:
+            self._note_inbound_unbind(key, lost, "entry_pruned")
         return len(stale)
 
     @_guarded
@@ -976,6 +1086,7 @@ class SessionMap:
         link: ChannelLink | None,
         *,
         accepts_inbound: bool = False,
+        reason: str = UNBIND_REASON_UNSPECIFIED,
     ) -> None:
         """Bind (or clear, when *link* is None) a session's mirror target.
 
@@ -983,6 +1094,11 @@ class SessionMap:
         messages arriving from that exact channel location may be routed back to
         *key*. Ordinary dashboard mirrors remain outbound-only. Slack keeps its
         dedicated reverse index and therefore ignores this flag.
+
+        ``reason`` describes the removal this call performs, if any: a None
+        *link*, or an overwrite that displaces an inbound binding — rebinding to
+        another location, or to the same one as outbound-only, both end a session
+        resume as thoroughly as an unlink does.
 
         Raises :class:`ConversationOwnershipConflict` when another session already
         holds this exact location AND the conversation is inbound-committed —
@@ -992,7 +1108,7 @@ class SessionMap:
         conversation stay as permitted as they were before this rule.
         """
         if link is None:
-            self.clear_mirror_link(key)
+            self.clear_mirror_link(key, reason=reason)
             return
         if link.channel_type == SLACK_NAMESPACE:
             self.set_slack_link(key, link.thread_id or "", link.channel_id)
@@ -1005,12 +1121,15 @@ class SessionMap:
                 f"{len(rivals)} other session(s)"
             )
         entry = self._ensure_entry(key)
+        displaced = self._inbound_binding(entry)
         entry["mirror"] = link.to_dict()
         if accepts_inbound:
             entry["mirror_accepts_inbound"] = True
         else:
             entry.pop("mirror_accepts_inbound", None)
         self._save()
+        if displaced is not None and (displaced != link or not accepts_inbound):
+            self._note_inbound_unbind(key, displaced, reason)
 
     @_guarded
     def mirror_claim_blockers(
@@ -1166,7 +1285,9 @@ class SessionMap:
         return matches
 
     @_guarded
-    def clear_mirror_links_at(self, link: ChannelLink) -> list[str]:
+    def clear_mirror_links_at(
+        self, link: ChannelLink, *, reason: str = UNBIND_REASON_UNSPECIFIED
+    ) -> list[str]:
         """Clear EVERY session whose mirror targets an exact non-Slack location.
 
         The write counterpart of :meth:`find_mirror_sessions`. An in-channel
@@ -1184,19 +1305,27 @@ class SessionMap:
         exactly as in :meth:`find_mirror_sessions`.
         """
         cleared: list[str] = []
+        lost: list[tuple[str, ChannelLink]] = []
         for key in self.find_mirror_sessions(link):
             entry = self._data.get(key)
             if entry is None:  # pragma: no cover - keys come from _data itself
                 continue
+            inbound = self._inbound_binding(entry)
             entry.pop("mirror", None)
             entry.pop("mirror_accepts_inbound", None)
             cleared.append(key)
+            if inbound is not None:
+                lost.append((key, inbound))
         if cleared:
             self._save()
+        # A sweep can clear several sessions at one location; each one lost its
+        # own way back, so each is audited and announced separately.
+        for key, inbound in lost:
+            self._note_inbound_unbind(key, inbound, reason)
         return cleared
 
     @_guarded
-    def clear_mirror_link(self, key: str) -> bool:
+    def clear_mirror_link(self, key: str, *, reason: str = UNBIND_REASON_UNSPECIFIED) -> bool:
         """Remove a session's outbound mirror binding; return True iff one existed.
 
         A non-Slack ``mirror`` field is dropped directly; a Slack binding is
@@ -1210,9 +1339,12 @@ class SessionMap:
         if not entry:
             return False
         if entry.get("mirror") is not None:
+            inbound = self._inbound_binding(entry)
             entry.pop("mirror", None)
             entry.pop("mirror_accepts_inbound", None)
             self._save()
+            if inbound is not None:
+                self._note_inbound_unbind(mkey, inbound, reason)
             return True
         if entry.get("slack_thread_ts") or entry.get("slack_channel_id"):
             return self.clear_slack_link(mkey)

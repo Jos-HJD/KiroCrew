@@ -35,6 +35,7 @@ from kiro_crew.history import latest_transcript_ts, monotonic_transcript_ts
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.messaging.link import (
     SLACK_NAMESPACE,
+    UNBIND_REASON_USER_UNLINK,
     ChannelLink,
     channel_namespace_of,
     is_channel_session_key,
@@ -441,6 +442,14 @@ _AUTO_COMPACT_FAILED_NOTICE = (
 _SESSION_RECYCLED_NOTICE = (
     "♻️ This session was recycled by the watchdog ({reason}). "
     "Conversation history is preserved — your next message starts a fresh process."
+)
+#: Sent to a conversation that just lost its inbound resume binding, so the next
+#: message landing in a brand-new session is explained rather than mysterious.
+#: ``!sessions`` is Discord's command and Discord is the only transport that binds
+#: inbound, so the instruction is reachable wherever this notice can arrive.
+_INBOUND_UNBIND_NOTICE = (
+    '🔗 This conversation was detached from session "{title}" ({reason}). '
+    "Run `!sessions` to reattach."
 )
 #: Shown when the out-of-band watchdog finds a turn whose consumer stopped
 #: pulling events. Deliberately describes the observation rather than promising a
@@ -2617,6 +2626,80 @@ class DashboardState:
             logging.getLogger(__name__).exception(
                 "Failed to deliver channel compact notice for %s", key
             )
+
+    def wire_session_unbind_listener(self) -> None:
+        """Register the channel notice for a removed inbound resume binding.
+
+        The session map audits every removal itself; what it cannot do is reach
+        the conversation, because that means resolving a transport. This is where
+        those two halves meet: the gateway owns the transport registry, so the
+        announcement is registered from here.
+        """
+
+        def _on_unbind(key: str, link: ChannelLink, reason: str) -> None:
+            if reason == UNBIND_REASON_USER_UNLINK:
+                # The in-channel unlink command has already replied in this very
+                # conversation, so a notice here would be an echo of it.
+                return
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # The map is synchronous and reachable from a worker thread or a
+                # CLI process, where there is no loop to send on. The SEL event
+                # has already recorded the removal, so the notice is the only
+                # thing lost.
+                logging.getLogger(__name__).debug(
+                    "No running loop for inbound-unbind notice on %s", key
+                )
+                return
+            loop.create_task(self._notify_inbound_unbind(key, link, reason))
+
+        self.sessions.set_unbind_listener(_on_unbind)
+
+    async def _notify_inbound_unbind(self, key: str, link: ChannelLink, reason: str) -> None:
+        """Tell the conversation behind *link* that it is no longer attached.
+
+        Rides the governed cross-surface ladder rather than the transport
+        directly, so the send is capability-checked and governance-vetted like
+        every other outbound notice. Best-effort: the binding is already gone and
+        audited, so an unreachable, ungoverned or unregistered channel is logged
+        and dropped rather than raised on a background task.
+        """
+        # Lazy: chat_runner imports this module at scope, so a top-level import
+        # here would close the cycle.
+        from kiro_crew.dashboard.chat_runner import _resolve_channel_target
+
+        try:
+            # Off-loop: the ladder's governance gate walks the profile directory,
+            # which is unbounded on slow storage.
+            target = await asyncio.to_thread(_resolve_channel_target, self, key, link)
+            if target is None:
+                return
+            resolved, transport = target
+            await transport.send_message(
+                resolved.channel_id,
+                _INBOUND_UNBIND_NOTICE.format(title=self._unbind_notice_title(key), reason=reason),
+                thread_id=resolved.thread_id,
+            )
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "Failed to deliver inbound-unbind notice for %s", key, exc_info=True
+            )
+
+    def _unbind_notice_title(self, key: str) -> str:
+        """Name the detached session the way the user saw it, falling back to *key*.
+
+        A title only exists while a slot is displaying the session; the raw key is
+        still enough to identify it, so no lookup beyond the in-memory slot is
+        worth doing for a notice.
+        """
+        from kiro_crew.dashboard.chat_utils import dashboard_slot_key
+
+        slot_key = dashboard_slot_key(key)
+        slot = self.get_slot(slot_key) if slot_key else None
+        if slot is None:
+            return key
+        return slot.display_title or key
 
     def wire_session_recycle_callback(self) -> None:
         """Register the dashboard's recycle-notification callback.

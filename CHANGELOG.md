@@ -4,6 +4,19 @@ All notable changes to KiroCrew are documented in this file.
 
 ## [Unreleased]
 
+- **Every `kirocrew` command starts ~0.8 s faster, and each MCP stdio server
+  drops ~58 MB of resident memory.** `cli.py` imported its full 132-subcommand
+  dispatch table at module scope — including the Slack gateway, the dashboard
+  state module and (through it) numpy — so every CLI invocation and every
+  long-lived MCP backend process (`mcp-core`, `mcp-cron`, `mcp-computer`) paid
+  ~1.3 s and ~112 MB for subcommands that never run. The four heavy import
+  statements now execute inside the one dispatch branch that uses each name,
+  cutting a fresh `import kiro_crew.cli` to ~0.5 s / ~54 MB. A ratchet test
+  keeps the deferred modules out of module scope and verifies every deferred
+  import still resolves. Behavior is unchanged: the entry point, the
+  fail-closed security prelude, and all subcommand dispatch are untouched.
+  (#3504)
+
 - **A lesson from a previous embedding-model generation could no longer get
   silently deleted or offered as a false contradiction.** `write_lesson`'s
   semantic dedup and `find_contradiction_candidates` compared raw embeddings

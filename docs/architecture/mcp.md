@@ -120,6 +120,44 @@ from the live `kirocrew` binary, strips stale remote-transport fields (`url`,
 gateway is actually running under while preserving the user's own env keys.
 User customizations such as `autoApprove` are preserved.
 
+An entry may also carry a **`spec_gate`** — a predicate consulted at spec
+EMISSION time. `kirocrew-computer` is the one row that has one, and the
+distinction it draws is the difference between a capability that advertises no
+tools and one that costs nothing: emitting the entry is what makes kiro-cli spawn
+the backend, so an in-process enable check can only ever refuse work in a process
+that is already resident (~109 MB, per chat process, including every `spawn_run`
+subagent). While the gate is closed the server appears in neither `mcpServers`
+nor `tools`, so nothing is spawned at all. Both loops that write specs honour it,
+and asymmetrically on purpose:
+
+- `build_agent_config()` withholds the entry **and pops one arriving from the
+  user override file** — a platform gate exists because there is no driver on
+  this OS, and an override must not smuggle a server past it;
+- `_refresh_dynamic_fields()` **retracts** an entry a previous pass wrote while
+  the gate was open, because a skip-only refresh would mean turning a feature off
+  never reclaims the process turning it on started. The entry's **user-owned
+  half** (`autoApprove`, their own `env` keys — the fields a refresh preserves
+  rather than rewrites) is parked in `agent_state` first and restored when the
+  gate reopens, so an off/on cycle does not silently reset the user's
+  configuration. It cannot be parked in the spec: `deny_unknown_fields` rejects
+  the whole file on one unknown key. The split is enforced in **both**
+  directions — a hand-edited or legacy park cannot inject a `command`, a
+  `KIROCREW_HOME` pin, or a transport `type` back into the emitted entry;
+- `_prune_gated_managed_refs()` then strips the `@server` / `@server/tool` refs,
+  since the shipped template grants `@kirocrew-computer` unconditionally and
+  kiro-cli mounts a server *because* something references it. Scoped to gated
+  servers only: a server dropped for an unresolvable command keeps its ref, or
+  one bad PATH would permanently delete the user's grant.
+
+Withholding is recorded to SEL as `mcp_server_withheld`, derived from the gate
+plus the shipped template rather than from what a given rebuild deleted — a fresh
+build has no ref left to remove by the time the prune runs, and that is precisely
+the case where a shipped permission is withheld from a brand-new install.
+
+The gate decision is snapshotted **once per rebuild** and threaded through both
+loops and the prune, so a keystone flip landing mid-rebuild cannot produce a spec
+that mounts a server whose ref was just pruned (or the reverse).
+
 Under an enterprise MCP registry, `_refresh_dynamic_fields()` also maintains a
 `"type": "registry"` marker on these three entries — added when
 `agent.mcp_registry_mode` is declared, and REMOVED when it is not. The marker is
@@ -137,7 +175,8 @@ request, so `hooks.on_tool_call` (the PreToolUse deny floor, sensitive-path
 check and governance ceiling) is never reached for it. For a tool that can click
 and type into an already-authenticated application, that would be a complete
 gate bypass. Its stdio shim answers an empty `tools/list` while the keystone
-enable is off, so a disabled feature costs the model no context.
+enable is off — retained as defence in depth for a mid-session disable, on top of
+the `spec_gate` above that keeps the process from existing in the first place.
 
 ### The final auto-approve pass
 

@@ -15,6 +15,17 @@ Two values are tracked, both kept in this sidecar rather than the kiro spec:
 - ``cc_model`` (str): a per-agent model for the ``claude_code`` provider (that
   backend can't pick a per-agent model from ``--agent`` the way kiro-cli does).
 
+A third, per-managed-server, exists for one narrow reason:
+
+- ``parked_mcp_fields`` (dict): the USER-OWNED fields of a managed MCP server
+  whose ``spec_gate`` is currently closed. Withholding such a server means
+  removing its ``mcpServers`` entry, and the entry can carry customizations a
+  refresh deliberately PRESERVES rather than rewrites (``autoApprove``, extra
+  ``env`` keys). Deleting them would make an off/on cycle silently reset the
+  user's configuration, so they are parked here and restored when the gate
+  reopens. They cannot be parked in the spec itself: ``deny_unknown_fields``
+  rejects the whole file on any key kiro-cli does not know.
+
 State file (``~/.kiro/crew/agent_model_state.json``, honoring ``KIROCREW_HOME``)::
 
     {
@@ -42,6 +53,7 @@ logger = logging.getLogger(__name__)
 _STATE_FILENAME = "agent_model_state.json"
 _MODEL_MANAGED = "model_managed"
 _CC_MODEL = "cc_model"
+_PARKED_MCP = "parked_mcp_fields"
 
 # Guards in-process read-modify-write races (e.g. dashboard PATCH vs gateway
 # refresh). Cross-process atomicity is provided by ``atomic_write``.
@@ -120,3 +132,47 @@ def prune(name: str) -> None:
         if name in data:
             data.pop(name, None)
             _write(data)
+
+
+def get_parked_mcp_fields(name: str, server: str) -> dict:
+    """Return the parked user-owned fields for *server*, or ``{}``.
+
+    ``{}`` covers "nothing parked" and "the sidecar is unreadable" alike: the
+    restore is additive, so an unavailable park costs the user their
+    customization on this one cycle and never corrupts the emitted spec.
+    """
+    with _lock:
+        parked = _entry(_read(), name).get(_PARKED_MCP)
+    if not isinstance(parked, dict):
+        return {}
+    fields = parked.get(server)
+    return dict(fields) if isinstance(fields, dict) else {}
+
+
+def set_parked_mcp_fields(name: str, server: str, fields: dict | None) -> None:
+    """Park (or clear, when *fields* is empty) a server's user-owned fields.
+
+    Clearing prunes the empty containers so the sidecar does not accumulate a
+    row per server that was merely gated once.
+    """
+    with _lock:
+        data = _read()
+        entry = data.get(name)
+        if not isinstance(entry, dict):
+            entry = {}
+        parked = entry.get(_PARKED_MCP)
+        if not isinstance(parked, dict):
+            parked = {}
+        if fields:
+            parked[server] = dict(fields)
+        else:
+            parked.pop(server, None)
+        if parked:
+            entry[_PARKED_MCP] = parked
+        else:
+            entry.pop(_PARKED_MCP, None)
+        if entry:
+            data[name] = entry
+        else:
+            data.pop(name, None)
+        _write(data)

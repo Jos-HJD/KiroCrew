@@ -1523,8 +1523,14 @@ class TestEnableRestartsSessions:
 
     @staticmethod
     def _spy(monkeypatch) -> list:
-        """Record calls to ``_reset_all_sessions`` without touching real sessions."""
+        """Record calls to ``_reset_all_sessions`` without touching real sessions.
+
+        Also stubs the spec rebuild the enable flip now performs: the real one
+        writes ``~/.kiro/agents``, which is machine-wide and deliberately NOT
+        under the redirected data home these fixtures create.
+        """
         calls: list = []
+        import kiro_crew.agent as agent_mod
         import kiro_crew.dashboard.handlers.sessions as sessions_mod
 
         async def _fake(request):
@@ -1532,6 +1538,7 @@ class TestEnableRestartsSessions:
             return 3
 
         monkeypatch.setattr(sessions_mod, "_reset_all_sessions", _fake)
+        monkeypatch.setattr(agent_mod, "rebuild_agent_config", lambda **_: Path("/dev/null"))
         return calls
 
     @pytest.mark.asyncio
@@ -1597,6 +1604,105 @@ class TestEnableRestartsSessions:
         assert resp.status == 200
         assert body["enabled"] is True
         assert body["sessions_reset"] == 0
+        assert json.loads(state_file.read_text())[STATE_KEY_ENABLED] is True
+
+    @pytest.mark.asyncio
+    async def test_the_flip_REBUILDS_the_agent_spec(self, state_file, monkeypatch):
+        """The enable is a spec-emission gate, so the reset needs a fresh spec.
+
+        ``agent._computer_use_spec_gate`` keeps ``kirocrew-computer`` out of the
+        emitted spec while the keystone is off, so restarting sessions without
+        rebuilding would restart them into a spec that still omits the server —
+        the operator enables the feature and the tools appear only after the next
+        gateway start.
+        """
+        import kiro_crew.agent as agent_mod
+
+        self._spy(monkeypatch)
+        built: list = []
+        monkeypatch.setattr(
+            agent_mod,
+            "rebuild_agent_config",
+            lambda **k: (built.append(k), Path("/dev/null"))[1],
+        )
+        async with _client() as client:
+            resp = await client.put("/api/computer-use/config", json={"enabled": True})
+        assert resp.status == 200
+        assert len(built) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_NO_OP_resave_does_not_rebuild(self, state_file, monkeypatch):
+        """Same narrowness as the reset: no transition, no work."""
+        import kiro_crew.agent as agent_mod
+
+        state_file.write_text(json.dumps({STATE_KEY_ENABLED: True}), encoding="utf-8")
+        self._spy(monkeypatch)
+        built: list = []
+        monkeypatch.setattr(
+            agent_mod,
+            "rebuild_agent_config",
+            lambda **k: (built.append(k), Path("/dev/null"))[1],
+        )
+        async with _client() as client:
+            resp = await client.put("/api/computer-use/config", json={"enabled": True})
+        assert resp.status == 200
+        assert built == []
+
+    @pytest.mark.asyncio
+    async def test_the_spec_rebuild_HOLDS_the_config_lock(self, state_file, monkeypatch):
+        """**The rebuild must not escape the lock that serialises keystone writes.**
+
+        The rebuild READS the keystone and WRITES the spec. Outside the lock, two
+        overlapping PUTs interleave: an enable's slower rebuild can land its spec
+        AFTER a later disable's, leaving a spec that mounts — and therefore spawns
+        — the server the keystone now forbids. Holding the lock makes
+        read-decide-write atomic against every keystone writer, so whichever
+        rebuild finishes last is the one that read the final state.
+
+        Asserted on the lock's own state at rebuild time rather than on source
+        order: a lock acquired and released before the call would read the same in
+        the source and fix nothing.
+        """
+        import kiro_crew.agent as agent_mod
+        from kiro_crew.dashboard.handlers.agents import _get_config_lock
+
+        self._spy(monkeypatch)
+        # Resolved on the loop: ``_get_config_lock`` needs a running loop, and the
+        # rebuild itself runs in a worker thread where there is none.
+        lock = _get_config_lock()
+        held: list[bool] = []
+        monkeypatch.setattr(
+            agent_mod,
+            "rebuild_agent_config",
+            lambda **_: (held.append(lock.locked()), Path("/dev/null"))[1],
+        )
+        async with _client() as client:
+            resp = await client.put("/api/computer-use/config", json={"enabled": True})
+        assert resp.status == 200
+        assert held == [True], "the spec rebuild ran outside the config lock"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_rebuild_does_not_fail_the_SAVE(self, state_file, monkeypatch):
+        """Same rule the reset already followed: the write landed and was audited.
+
+        The fallback is the pre-existing behaviour — the tool surface appears on
+        the next gateway start — and the sessions are still reset, because a stale
+        ``tools/list`` is a separate problem from a stale spec.
+        """
+        import kiro_crew.agent as agent_mod
+
+        calls = self._spy(monkeypatch)
+
+        def _boom(**_):
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr(agent_mod, "rebuild_agent_config", _boom)
+        async with _client() as client:
+            resp = await client.put("/api/computer-use/config", json={"enabled": True})
+            body = await resp.json()
+        assert resp.status == 200
+        assert body["enabled"] is True
+        assert len(calls) == 1
         assert json.loads(state_file.read_text())[STATE_KEY_ENABLED] is True
 
 

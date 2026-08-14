@@ -479,20 +479,211 @@ def _kirocrew_mcp_invocation(subcommand: str) -> tuple[str, list[str]]:
     return bin_path, [subcommand]
 
 
+def _computer_use_spec_gate() -> bool:
+    """Whether ``kirocrew-computer`` belongs in an EMITTED agent spec.
+
+    The shim's own ``enable_state.is_enabled()`` checks (in ``_list_tools`` and
+    again in the dispatcher) decide what a RUNNING backend may do; they cannot
+    decide whether it runs at all, because they execute inside the process the
+    spec already caused kiro-cli to spawn. So a disabled feature still cost a
+    full backend process — ~109 MB, per chat process including every
+    ``spawn_run`` subagent — and on Linux/Windows it cost that for a capability
+    with no driver at all (see ``backend.select_default_backend``: macOS is the
+    only platform with one). This gate is the same decision moved to the only
+    place that can act on it: spec emission.
+
+    Both in-process checks stay as defence in depth. They still cover the case
+    this gate structurally cannot — the keystone flipping OFF mid-session, after
+    the spec was written and the backend spawned.
+
+    Fails CLOSED, matching the keystone's own posture (``enable_state`` reads a
+    missing / unreadable / malformed file as DISABLED): the open position of this
+    gate hands out the operator's whole desktop, so an unreadable ceiling must
+    never be read generously.
+    """
+    if not platform_compat.IS_MACOS:
+        return False
+    try:
+        # Function-local: ``enable_state`` reaches ``config.loader`` at module
+        # scope, and agent.py imports that loader function-locally everywhere
+        # else for exactly that reason — a module-scope import here would close
+        # an import cycle through the config plane.
+        from kiro_crew.computer_use import enable_state
+
+        return enable_state.is_enabled()
+    except Exception:
+        logger.debug(
+            "computer-use keystone unreadable; omitting it from the agent spec",
+            exc_info=True,
+        )
+        return False
+
+
+def _gated_off_servers() -> frozenset[str]:
+    """Managed servers whose ``spec_gate`` is CLOSED right now.
+
+    Evaluated ONCE per rebuild and threaded through the emit loops and the
+    ``@ref`` prune, rather than each of them re-reading the gate. The reads are
+    cheap; agreeing is the point — a keystone flip landing between two
+    independent reads would emit a server whose ref was just pruned (mounted, no
+    tools) or prune nothing while the entry was withheld (a ref naming a server
+    that is not there). One snapshot makes both halves of a rebuild describe the
+    same decision.
+
+    A gate that raises is treated as closed, for the same fail-closed reason the
+    computer-use gate itself is.
+    """
+    closed: set[str] = set()
+    for name, spec in _MANAGED_MCP_SERVERS.items():
+        gate = spec.get("spec_gate")
+        if gate is None:
+            continue
+        try:
+            if not gate():
+                closed.add(name)
+        except Exception:
+            logger.debug("spec gate for %s raised; treating as closed", name, exc_info=True)
+            closed.add(name)
+    return frozenset(closed)
+
+
+def _prune_gated_managed_refs(config: dict, gated_off: frozenset[str]) -> list[str]:
+    """Strip ``@server`` / ``@server/tool`` refs for servers we did not emit.
+
+    A gated-off server has no ``mcpServers`` entry, and a ref with no matching
+    entry is precisely the state ``_install_heartbeat_agent`` builds its ``tools``
+    list to avoid. It also is not merely cosmetic: kiro-cli mounts a server
+    BECAUSE something references it, so a surviving ref is what would keep
+    spawning the very backend the gate just declined.
+
+    Two sources put the ref there in the first place — the shipped
+    ``defaults.json`` grants ``@kirocrew-computer`` unconditionally, and a config
+    written while the gate was open still carries it — so this runs on fresh and
+    existing configs alike. Scoped to gated servers ONLY: a server dropped for an
+    unresolvable command must keep its ref, or one bad PATH would permanently
+    delete the user's grant.
+
+    Returns the refs removed, for the caller's SEL record.
+    """
+    removed: list[str] = []
+    for name in sorted(gated_off):
+        ref = f"@{name}"
+        prefix = f"{ref}/"
+        for key in ("tools", "allowedTools"):
+            lst = config.get(key)
+            if not isinstance(lst, list):
+                continue
+            kept = [
+                t
+                for t in lst
+                if not (isinstance(t, str) and (t == ref or t.startswith(prefix)))
+            ]
+            if len(kept) != len(lst):
+                lst[:] = kept
+                if ref not in removed:
+                    removed.append(ref)
+    return removed
+
+
+# Fields on a managed ``mcpServers`` entry that WE own and rewrite on every
+# refresh. Everything else on the entry is the user's (``autoApprove`` is the
+# documented case, and a hand-added key we don't know about is theirs by
+# definition), which is what makes this the correct split for parking: we can
+# always regenerate our own half, and must never silently drop theirs.
+_MANAGED_ENTRY_KEYS = frozenset({"command", "args", "url", "headers", "type"})
+
+
+def _user_owned_entry_fields(entry: dict) -> dict:
+    """Return the half of a managed server entry that the refresh PRESERVES.
+
+    ``env`` is split rather than classified: ``KIROCREW_HOME`` is our pin (it is
+    refreshed and cleared with the override), while any other variable the user
+    put there is theirs and survives a refresh today.
+    """
+    kept = {k: v for k, v in entry.items() if k not in _MANAGED_ENTRY_KEYS and k != "env"}
+    env = entry.get("env")
+    if isinstance(env, dict):
+        user_env = {k: v for k, v in env.items() if k != "KIROCREW_HOME"}
+        if user_env:
+            kept["env"] = user_env
+    return kept
+
+
+def _park_gated_entry(agent_name: str, server: str, entry: dict) -> None:
+    """Preserve a withheld server's user-owned fields in the sidecar.
+
+    Withholding a gated server means REMOVING its ``mcpServers`` entry, and that
+    entry can carry customizations a refresh deliberately preserves instead of
+    rewriting. Deleting them outright would make an off/on cycle silently reset
+    the user's configuration — a disable would cost them their ``autoApprove``
+    and their own ``env`` keys, and the re-enable would hand back defaults.
+
+    They cannot be parked in the spec: kiro-cli validates it with
+    ``deny_unknown_fields`` and rejects the WHOLE file on one unknown key.
+    Best-effort — a sidecar we cannot write must not fail the rebuild, because
+    the alternative is emitting a server the gate refused.
+    """
+    fields = _user_owned_entry_fields(entry)
+    if not fields:
+        return
+    try:
+        agent_state.set_parked_mcp_fields(agent_name, server, fields)
+    except Exception:
+        logger.debug("could not park user fields for %s", server, exc_info=True)
+
+
+def _restore_parked_entry(agent_name: str, server: str, entry: dict) -> None:
+    """Put a previously parked server's user-owned fields back, then clear them.
+
+    Filtered on the way OUT as well as the way in: the sidecar is a plain JSON
+    file, so a hand-edit (or a park written by an older build with a different
+    notion of "ours") can hold a ``command`` or a ``KIROCREW_HOME`` pin. Reading
+    those back would restore a dead binary path, or point the shim at a home the
+    gateway no longer uses — the exact desync the pin exists to prevent. The park
+    is a store of the user's half only, and this end enforces that too.
+    """
+    try:
+        fields = agent_state.get_parked_mcp_fields(agent_name, server)
+    except Exception:
+        logger.debug("could not read parked fields for %s", server, exc_info=True)
+        return
+    fields = _user_owned_entry_fields(fields) if fields else {}
+    if not fields:
+        return
+    for key, value in fields.items():
+        if key == "env" and isinstance(value, dict):
+            env = entry.setdefault("env", {})
+            if isinstance(env, dict):
+                for env_key, env_value in value.items():
+                    env.setdefault(env_key, env_value)
+            continue
+        entry.setdefault(key, value)
+    try:
+        agent_state.set_parked_mcp_fields(agent_name, server, None)
+    except Exception:
+        logger.debug("could not clear parked fields for %s", server, exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Managed MCP servers — single source of truth.
 #
 # Every server here is dynamically injected into the agent config at install
 # time (both fresh and existing configs).  Adding a new managed server =
 # one entry here.
+#
+# An entry may carry a ``spec_gate`` callable: a predicate consulted at spec
+# EMISSION time, so a capability that is off (or impossible on this platform)
+# costs no backend process rather than merely no tools.  Absent = always
+# emitted, which is what the two always-on servers want.
 # ---------------------------------------------------------------------------
 _MANAGED_MCP_SERVERS: dict[str, dict] = {
     "kirocrew-cron": {"invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-cron")},
     "kirocrew-core": {"invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-core")},
-    # Computer use (native desktop GUI automation).  Registered unconditionally —
-    # its stdio shim returns an EMPTY tools/list while the keystone primary enable
-    # is off, so a disabled feature costs the model no context and needs no
-    # per-server ``enabled_fn`` in this loop.
+    # Computer use (native desktop GUI automation).  ``spec_gate`` keeps the
+    # entry out of the emitted spec unless this is macOS AND the keystone primary
+    # enable is on, so kiro-cli never spawns the backend for a feature that is
+    # off or unsupported (see _computer_use_spec_gate).  The shim's own empty
+    # ``tools/list`` while disabled is retained as defence in depth.
     #
     # DELIBERATELY NO ``autoApprove`` KEY, and none may ever be added: kiro-cli
     # approves an autoApproved MCP tool locally and emits no permission request,
@@ -500,7 +691,10 @@ _MANAGED_MCP_SERVERS: dict[str, dict] = {
     # floor, the sensitive-path check and the governance ceiling — is NEVER
     # reached for it. For a tool that can click in an already-authenticated
     # application that would be a complete gate bypass.
-    "kirocrew-computer": {"invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-computer")},
+    "kirocrew-computer": {
+        "invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-computer"),
+        "spec_gate": _computer_use_spec_gate,
+    },
 }
 
 
@@ -1546,7 +1740,7 @@ def _apply_user_kiro_hooks(config: dict, mc_cfg: dict) -> None:
         logger.debug("SEL audit for kiro_hooks merge failed", exc_info=True)
 
 
-def build_agent_config() -> dict:
+def build_agent_config(*, gated_off: "frozenset[str] | None" = None) -> dict:
     """Return the final agent config (shipped defaults + user overrides + dynamic fields).
 
     Security-critical ``hooks`` always use the bundled config as their base,
@@ -1556,6 +1750,11 @@ def build_agent_config() -> dict:
     hooks.py PreToolUse gate, not via the kiro agent spec. User-defined
     ``kiro_hooks`` from ``~/.kiro/crew/config.json`` are then additively merged;
     bundled hooks always run first and cannot be removed.
+
+    Args:
+        gated_off: Managed servers whose ``spec_gate`` is closed. Pass the
+            caller's snapshot so one rebuild's emit loops and its ``@ref`` prune
+            agree; omitted, it is evaluated here.
     """
     config = _load_json(_shipped_defaults())
     config = _deep_merge(config, _load_json(_user_overrides_path()))
@@ -1583,7 +1782,18 @@ def build_agent_config() -> dict:
     config["prompt"] = f"file://{_prompt_path()}"
     mcp = config.setdefault("mcpServers", {})
     registry_mode = _mcp_registry_mode()
+    if gated_off is None:
+        gated_off = _gated_off_servers()
     for name, spec in _MANAGED_MCP_SERVERS.items():
+        if name in gated_off:
+            # The gate is the whole point of this branch: emitting the entry is
+            # what makes kiro-cli spawn the backend, so a closed gate must not
+            # emit one. ``pop`` as well as ``continue`` because the base here is
+            # shipped defaults merged with the user override file, and an entry
+            # arriving from there would otherwise slip past a platform gate that
+            # exists because the capability has no driver on this OS.
+            mcp.pop(name, None)
+            continue
         if "invocation_fn" in spec:
             cmd, args = spec["invocation_fn"]()
         else:
@@ -1614,6 +1824,13 @@ def build_agent_config() -> dict:
     for name, spec in _extra_mcp_servers().items():
         mcp.setdefault(name, dict(spec))
 
+    # The shipped template grants ``@kirocrew-computer`` in ``tools``
+    # unconditionally, so a gated-off server would leave a ref naming a server
+    # this spec does not define. Pruned HERE rather than only in
+    # ``rebuild_agent_config`` because the derived agents (research, lite) take
+    # this dict as-is and never run that path.
+    _prune_gated_managed_refs(config, gated_off)
+
     # Default-model tracking ("managed" vs frozen) is recorded in the
     # agent_state sidecar by the install path (rebuild_agent_config), never as
     # a kiro-spec key — kiro-cli rejects unknown fields and would drop the whole
@@ -1622,11 +1839,18 @@ def build_agent_config() -> dict:
     return config
 
 
-def _refresh_dynamic_fields(config: dict) -> None:
+def _refresh_dynamic_fields(
+    config: dict, *, gated_off: "frozenset[str] | None" = None
+) -> None:
     """Update security-critical and dynamic fields in an existing config.
 
     Called when ``kirocrew.json`` already exists so user customizations are
     preserved while security controls and runtime paths stay current.
+
+    Args:
+        gated_off: Managed servers whose ``spec_gate`` is closed. Pass the
+            caller's snapshot so one rebuild's emit loops and its ``@ref`` prune
+            agree; omitted, it is evaluated here.
     """
     # Prompt URI — always resolve at install time
     config["prompt"] = f"file://{_prompt_path()}"
@@ -1635,9 +1859,35 @@ def _refresh_dynamic_fields(config: dict) -> None:
     # Only refresh command/args; preserve user customizations (e.g. autoApprove).
     mcp = config.setdefault("mcpServers", {})
     registry_mode = _mcp_registry_mode()
+    if gated_off is None:
+        gated_off = _gated_off_servers()
+    agent_name = config.get("name") or _MAIN_AGENT_NAME
     for name, spec in _MANAGED_MCP_SERVERS.items():
+        if name in gated_off:
+            # RETRACT, not merely skip: an earlier refresh wrote this entry while
+            # the gate was open, and leaving it would mean turning the feature
+            # off never reclaims the backend process turning it on started.
+            #
+            # The entry's user-owned half (``autoApprove``, their own ``env``
+            # keys) is PARKED first, because a refresh preserves those rather
+            # than rewriting them — dropping them here would make an off/on cycle
+            # silently reset the user's configuration. Our own half
+            # (command/args/type/the KIROCREW_HOME pin) is regenerated on every
+            # pass, so it needs no park.
+            existing = mcp.get(name)
+            if isinstance(existing, dict):
+                _park_gated_entry(str(agent_name), name, existing)
+            mcp.pop(name, None)
+            continue
         is_new = name not in mcp
         entry = mcp.setdefault(name, {})
+        if is_new:
+            # A gate that has REOPENED (or a first-ever emission) is where a park
+            # is redeemed: restore the user's own fields before we write ours, so
+            # an off/on cycle gives them back their configuration instead of a
+            # default entry. Additive and self-clearing — our fields below always
+            # win, so a stale command or env pin can never come back this way.
+            _restore_parked_entry(str(agent_name), name, entry)
         if "invocation_fn" in spec:
             entry["command"], entry["args"] = spec["invocation_fn"]()
         else:
@@ -1824,23 +2074,28 @@ def get_shipped_tools() -> dict[str, list[str]]:
     return {k: shipped.get(k, []) for k in ("tools", "allowedTools")}
 
 
-def _load_existing_config(path: Path) -> tuple[dict, bool]:
+def _load_existing_config(
+    path: Path, *, gated_off: "frozenset[str] | None" = None
+) -> tuple[dict, bool]:
     """Load and refresh an existing kirocrew.json.
 
     Returns (config, fresh_install).  Falls back to build_agent_config()
     when the file is corrupt or refresh fails.
+
+    *gated_off* is the caller's spec-gate snapshot, forwarded so every branch of
+    one rebuild reads the same decision.
     """
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, ValueError):
         config = None
     if not isinstance(config, dict):
-        return build_agent_config(), True
+        return build_agent_config(gated_off=gated_off), True
     try:
-        _refresh_dynamic_fields(config)
+        _refresh_dynamic_fields(config, gated_off=gated_off)
     except (AttributeError, TypeError, RuntimeError) as exc:
         logger.error("Refresh failed, rebuilding from defaults: %s", exc)
-        return build_agent_config(), True
+        return build_agent_config(gated_off=gated_off), True
     return config, False
 
 
@@ -2307,12 +2562,17 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
 
     # Managed MCP sync happens after config is fully built (see below).
 
+    # One spec-gate snapshot for the whole rebuild: the emit loop below and the
+    # ``@ref`` prune near the end must describe the SAME decision (see
+    # _gated_off_servers).
+    gated_off = _gated_off_servers()
+
     if not clean and path.exists():
         # Existing config — preserve user customizations, only refresh
         # security-critical and dynamic fields.
-        config, fresh_install = _load_existing_config(path)
+        config, fresh_install = _load_existing_config(path, gated_off=gated_off)
     else:
-        config = build_agent_config()
+        config = build_agent_config(gated_off=gated_off)
         fresh_install = True
 
     # Seed default-model tracking for a fresh/clean build. A clean regen always
@@ -2786,6 +3046,35 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
                 source="install_agent",
                 resources=f"{cu_ref} added to tools (existing config upgrade)",
             )
+
+    # A managed server whose spec gate is CLOSED was never emitted into
+    # ``mcpServers``, so its ``@ref`` must not survive in ``tools`` /
+    # ``allowedTools``. Runs after every writer above: the shipped template grants
+    # ``@kirocrew-computer`` unconditionally, and a config written while the gate
+    # was open still carries it.
+    _prune_gated_managed_refs(config, gated_off)
+
+    # Audit the DECISION, not this call's delta. A FRESH build has already had the
+    # ref stripped by ``build_agent_config`` (the derived agents need a
+    # self-consistent spec), so the prune above legitimately finds nothing to do
+    # there — and auditing the delta would leave the one case where a shipped
+    # permission is removed from a brand-new install with no record at all.
+    # Derived from the gate plus the shipped template instead, so both paths
+    # record the same fact: this server was withheld, and its grants went with it.
+    _withheld = sorted(
+        f"@{name}" for name in gated_off if f"@{name}" in get_shipped_tools().get("tools", [])
+    )
+    if _withheld:
+        sel().log_api_access(
+            caller="system",
+            operation="mcp_server_withheld",
+            outcome="ok",
+            source="install_agent",
+            resources=(
+                f"{', '.join(_withheld)} withheld from mcpServers/tools "
+                f"(unsupported platform or capability disabled)"
+            ),
+        )
 
     # Final dedup (preserves order).
     for key in ("tools", "allowedTools"):

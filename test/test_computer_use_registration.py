@@ -36,7 +36,7 @@ from unittest.mock import patch
 
 import pytest
 
-from kiro_crew import agent, mcp_cleanup, mcp_discovery, onboarding_import
+from kiro_crew import agent, agent_state, mcp_cleanup, mcp_discovery, onboarding_import
 from kiro_crew.agent import install_agent
 from kiro_crew.platform_compat import IS_POSIX
 
@@ -51,6 +51,18 @@ _MANAGED = {
     "kirocrew-cron": {"invocation_fn": lambda: ("/usr/bin/kirocrew", ["mcp-cron"])},
     "kirocrew-core": {"invocation_fn": lambda: ("/usr/bin/kirocrew", ["mcp-core"])},
     CU_SERVER: {"invocation_fn": lambda: ("/usr/bin/kirocrew", [CU_SUBCOMMAND])},
+}
+
+# The same set with the REAL gate on the computer-use row. ``_MANAGED`` above
+# deliberately carries none, so the pre-existing emission tests keep exercising
+# the ungated path; the gate's own tests stage this one.
+_GATED_MANAGED = {
+    "kirocrew-cron": {"invocation_fn": lambda: ("/usr/bin/kirocrew", ["mcp-cron"])},
+    "kirocrew-core": {"invocation_fn": lambda: ("/usr/bin/kirocrew", ["mcp-core"])},
+    CU_SERVER: {
+        "invocation_fn": lambda: ("/usr/bin/kirocrew", [CU_SUBCOMMAND]),
+        "spec_gate": agent._computer_use_spec_gate,
+    },
 }
 
 
@@ -77,13 +89,17 @@ def _bundled_defaults(tmp_path: Path) -> Path:
     return cfg_dir
 
 
-def _run_install(tmp_path: Path, cfg_dir: Path, **kwargs) -> Path:
+def _run_install(tmp_path: Path, cfg_dir: Path, *, managed: "dict | None" = None, **kwargs) -> Path:
     """Run ``install_agent`` with every module global redirected into *tmp_path*.
 
     The ``patch.multiple`` + ``ExitStack`` shape from ``test_agent.py``. This is
     what keeps a test from touching the developer's real ``~/.kiro/agents`` — which
     for THIS feature would mean writing a computer-use MCP entry into their live
     agent config.
+
+    *managed* overrides the staged managed-server set. It defaults to ``_MANAGED``
+    (no ``spec_gate``, so the emission tests below exercise the ungated path);
+    ``TestSpecEmissionGate`` passes the gated shape.
     """
     kiro_dir = tmp_path / "kiro_agents"
     kiro_dir.mkdir(exist_ok=True)
@@ -97,7 +113,7 @@ def _run_install(tmp_path: Path, cfg_dir: Path, **kwargs) -> Path:
             KIRO_AGENTS_DIR=kiro_dir,
             _BUNDLED_CFG_DIR=cfg_dir,
             _KIROCREW_BIN="/usr/bin/kirocrew",
-            _MANAGED_MCP_SERVERS=_MANAGED,
+            _MANAGED_MCP_SERVERS=_MANAGED if managed is None else managed,
             _KIRO_MCP_JSON=tmp_path / "fake_kiro_mcp.json",
             _CC_MCP_JSON=tmp_path / "fake_cc_mcp.json",
         ),
@@ -549,8 +565,576 @@ def test_computer_use_sources_are_scrub_lint_clean():
     )
 
 
+class TestGatedEntryKeepsUserCustomizations:
+    """**Withholding the server must not delete configuration the user owns.**
+
+    Retracting the entry is required — a config written while the gate was open
+    would otherwise keep spawning the backend after a disable — but the entry can
+    carry fields a refresh deliberately PRESERVES rather than rewrites:
+    ``autoApprove`` (pinned by ``test_refresh_preserves_a_user_added_auto_approve``)
+    and the user's own ``env`` keys (pinned by ``TestDataHomePin``). Deleting them
+    would make an off/on cycle silently reset the user's configuration.
+
+    They cannot be parked in the spec itself — kiro-cli validates it with
+    ``deny_unknown_fields`` and rejects the whole file on one unknown key — so the
+    sidecar that already exists for exactly this reason holds them.
+    """
+
+    _GATED = _GATED_MANAGED
+
+    @staticmethod
+    def _refresh(cfg: dict, *, macos: bool) -> None:
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.multiple("kiro_crew.agent", _MANAGED_MCP_SERVERS=_GATED_MANAGED)
+            )
+            stack.enter_context(
+                patch("kiro_crew.agent._prompt_path", return_value=Path("/tmp/p.md"))
+            )
+            stack.enter_context(patch("kiro_crew.platform_compat.IS_MACOS", macos))
+            if macos:
+                stack.enter_context(
+                    patch("kiro_crew.computer_use.enable_state.is_enabled", return_value=True)
+                )
+            agent._refresh_dynamic_fields(cfg)
+
+    @pytest.fixture(autouse=True)
+    def _isolated_sidecar(self, tmp_path, monkeypatch):
+        """Redirect ``agent_state``'s sidecar so the developer's real one is untouched."""
+        import kiro_crew.config.paths as paths
+
+        monkeypatch.setattr(paths, "_resolved_home", None)
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        (tmp_path / "home").mkdir(parents=True, exist_ok=True)
+        yield
+        monkeypatch.setattr(paths, "_resolved_home", None)
+
+    def _cfg(self) -> dict:
+        return {
+            "name": "kirocrew",
+            "mcpServers": {
+                CU_SERVER: {
+                    "command": "/usr/bin/kirocrew",
+                    "args": [CU_SUBCOMMAND],
+                    "autoApprove": [f"{CU_SERVER}/computer_get_state"],
+                    "env": {"MY_VAR": "keep"},
+                }
+            },
+        }
+
+    def test_an_off_then_ON_cycle_gives_the_customizations_BACK(self):
+        """The whole point: disable, re-enable, and the user's fields are still there."""
+        cfg = self._cfg()
+        self._refresh(cfg, macos=False)  # gate closed -> withheld
+        assert CU_SERVER not in cfg["mcpServers"]
+
+        self._refresh(cfg, macos=True)  # gate open -> re-emitted
+        entry = cfg["mcpServers"][CU_SERVER]
+        assert entry["autoApprove"] == [f"{CU_SERVER}/computer_get_state"]
+        assert entry["env"]["MY_VAR"] == "keep"
+        # Our own half is regenerated, never restored from the park.
+        assert entry["command"] == "/usr/bin/kirocrew"
+        assert entry["args"] == [CU_SUBCOMMAND]
+
+    def test_the_park_is_CLEARED_once_redeemed(self):
+        """A park that outlived its restore would resurrect fields the user later removed.
+
+        Asserted on the sidecar's raw content, not just on the getter: an empty
+        row reads back as ``{}`` either way, so only the file shows whether the
+        containers were actually pruned rather than left to accumulate one row per
+        server that was gated once.
+        """
+        cfg = self._cfg()
+        self._refresh(cfg, macos=False)
+        assert agent_state.get_parked_mcp_fields("kirocrew", CU_SERVER)
+        self._refresh(cfg, macos=True)
+        assert agent_state.get_parked_mcp_fields("kirocrew", CU_SERVER) == {}
+        assert "parked_mcp_fields" not in json.dumps(agent_state._read())
+
+        # Now the user deletes autoApprove; a later off/on must not bring it back.
+        cfg["mcpServers"][CU_SERVER].pop("autoApprove")
+        self._refresh(cfg, macos=False)
+        self._refresh(cfg, macos=True)
+        assert "autoApprove" not in cfg["mcpServers"][CU_SERVER]
+
+    def test_a_TAMPERED_park_cannot_inject_a_managed_field(self):
+        """The sidecar is a plain JSON file, so the restore filters it too.
+
+        A hand-edit (or a park written by an older build with a different notion
+        of "ours") can hold fields that are ours to decide. Most would be
+        harmlessly overwritten by the writes below the restore — but ``type`` is
+        not: the refresh only removes it when it equals the registry marker, so a
+        park carrying any OTHER ``type`` survives into the emitted spec and
+        changes how the entry is interpreted. Filtering on the way out closes
+        that, and keeps the park honestly a store of the user's half only.
+        """
+        agent_state.set_parked_mcp_fields(
+            "kirocrew",
+            CU_SERVER,
+            {
+                "command": "/attacker/kirocrew",
+                "args": ["mcp-evil"],
+                "type": "http",
+                "env": {"KIROCREW_HOME": "/stale", "MY_VAR": "keep"},
+                "autoApprove": ["ok"],
+            },
+        )
+        cfg: dict = {"name": "kirocrew", "mcpServers": {}}
+        self._refresh(cfg, macos=True)
+        entry = cfg["mcpServers"][CU_SERVER]
+        assert "type" not in entry, "a parked transport type reached the emitted spec"
+        assert entry["command"] == "/usr/bin/kirocrew"
+        assert entry["args"] == [CU_SUBCOMMAND]
+        # The pin is whatever the RESOLVER says (this fixture runs under an
+        # override home, so there legitimately is one) — never the parked value.
+        assert entry.get("env", {}).get("KIROCREW_HOME") != "/stale"
+        # The user's genuinely-owned fields still come back.
+        assert entry["autoApprove"] == ["ok"]
+        assert entry["env"]["MY_VAR"] == "keep"
+
+    def test_our_OWN_fields_are_not_parked(self):
+        """Parking ``command``/``args``/the home pin would let a stale one come back.
+
+        The pin in particular must track the home the GATEWAY runs under — a
+        restored one would point the shim at a home the gateway no longer uses,
+        which is the desync ``TestDataHomePin`` exists to prevent.
+        """
+        parked = agent._user_owned_entry_fields(
+            {
+                "command": "/old/kirocrew",
+                "args": [CU_SUBCOMMAND],
+                "type": "registry",
+                "url": "http://127.0.0.1:9999/mcp",
+                "headers": {"X": "1"},
+                "env": {"KIROCREW_HOME": "/stale", "MY_VAR": "keep"},
+                "autoApprove": ["x"],
+            }
+        )
+        assert parked == {"autoApprove": ["x"], "env": {"MY_VAR": "keep"}}
+
+    def test_an_UNCUSTOMIZED_entry_parks_nothing(self):
+        """No park row for a server the user never touched — the sidecar stays clean."""
+        cfg = {
+            "name": "kirocrew",
+            "mcpServers": {CU_SERVER: {"command": "/usr/bin/kirocrew", "args": [CU_SUBCOMMAND]}},
+        }
+        self._refresh(cfg, macos=False)
+        assert agent_state.get_parked_mcp_fields("kirocrew", CU_SERVER) == {}
+
+    def test_an_unwritable_sidecar_still_withholds_the_server(self, monkeypatch):
+        """Fail-safe direction: losing a customization beats emitting the server.
+
+        A park we cannot write must not abort the rebuild, because the only other
+        outcome is keeping the entry — i.e. spawning the backend the gate refused.
+        """
+        monkeypatch.setattr(
+            agent_state,
+            "set_parked_mcp_fields",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("read-only")),
+        )
+        cfg = self._cfg()
+        self._refresh(cfg, macos=False)
+        assert CU_SERVER not in cfg["mcpServers"]
+
+
 if __name__ == "__main__":  # pragma: no cover
     pytest.main([__file__, "-q"])
+
+
+# ── The spec-emission gate ──
+
+
+class TestSpecEmissionGate:
+    """The server must not reach the EMITTED spec when it cannot be used.
+
+    The two in-process checks (``_list_tools`` and the dispatcher) run inside a
+    process the spec already caused kiro-cli to spawn, so they can only make a
+    disabled feature advertise zero tools — they cannot make it cost nothing. It
+    cost ~109 MB per chat process, including every ``spawn_run`` subagent, and on
+    Linux/Windows it cost that for a capability with no driver at all.
+
+    So these assertions are on the SPEC, not on ``tools/list``: that is the
+    difference the fix is about, and a ``tools/list``-only test passes just as
+    well while the process is still being spawned. The existing ``tools/list``
+    tests stay — this gate is defence in depth's partner, not its replacement.
+    """
+
+    # The real gate, unlike the ``_MANAGED`` fixture above (which deliberately
+    # carries none so the pre-existing emission tests keep exercising the
+    # ungated path).
+    _GATED = _GATED_MANAGED
+
+    @staticmethod
+    def _build(tmp_path: Path, *, macos: bool, keystone: "dict | None") -> dict:
+        """Build a fresh spec with *macos* and *keystone* in effect.
+
+        The keystone is written to a real temp file and read through the real
+        ``enable_state``, so the four malformed spellings below are judged by the
+        production predicate rather than by a stub that could disagree with it.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        state_path = tmp_path / "computer_use.json"
+        if keystone is not None:
+            state_path.write_text(json.dumps(keystone), encoding="utf-8")
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.multiple(
+                    "kiro_crew.agent",
+                    _BUNDLED_CFG_DIR=cfg_dir,
+                    _MANAGED_MCP_SERVERS=TestSpecEmissionGate._GATED,
+                )
+            )
+            stack.enter_context(
+                patch("kiro_crew.agent._shipped_defaults", return_value=cfg_dir / "defaults.json")
+            )
+            stack.enter_context(
+                patch("kiro_crew.agent._prompt_path", return_value=cfg_dir / "prompt.md")
+            )
+            stack.enter_context(patch("kiro_crew.agent._project_dir", return_value=None))
+            stack.enter_context(
+                patch("kiro_crew.agent._mc_config_path", return_value=tmp_path / "none.json")
+            )
+            stack.enter_context(patch("kiro_crew.platform_compat.IS_MACOS", macos))
+            stack.enter_context(
+                patch(
+                    "kiro_crew.computer_use.enable_state.computer_use_state_path",
+                    return_value=state_path,
+                )
+            )
+            return agent.build_agent_config()
+
+    def test_a_non_darwin_platform_gets_no_entry(self, tmp_path: Path):
+        """**The Linux/Windows case — the one with no driver at all.**
+
+        Asserted with the keystone ENABLED, so the platform half of the gate is
+        proven on its own rather than passing because the feature happened to be
+        off too. ``select_default_backend`` has no driver here, so the spawned
+        process could never have done anything.
+        """
+        config = self._build(tmp_path, macos=False, keystone={"enabled": True})
+        assert CU_SERVER not in config["mcpServers"]
+        # The always-on servers are untouched — this is one gate, not a purge.
+        assert "kirocrew-core" in config["mcpServers"]
+        assert "kirocrew-cron" in config["mcpServers"]
+
+    @pytest.mark.parametrize(
+        "keystone",
+        [
+            None,  # file absent
+            {},  # present, empty
+            {"enabled": False},
+            {"enabled": "true"},  # truthy NON-True: a hand-edited string
+            {"enabled": 1},  # truthy NON-True: a hand-edited int
+        ],
+        ids=["absent", "empty", "false", "string-true", "int-one"],
+    )
+    def test_darwin_with_the_keystone_off_gets_no_entry(self, tmp_path: Path, keystone):
+        """Mirrors ``test_mcp_computer.py``'s keystone cases, one layer earlier.
+
+        The truthy-non-``True`` spellings matter for the same reason they matter
+        in ``enable_state.is_enabled``: a hand-edited ``"enabled": "false"`` is a
+        truthy string, and reading it generously would spawn a desktop-control
+        backend the operator never enabled.
+        """
+        config = self._build(tmp_path, macos=True, keystone=keystone)
+        assert CU_SERVER not in config["mcpServers"]
+
+    def test_darwin_with_the_keystone_ON_gets_the_entry(self, tmp_path: Path):
+        """**Guard against over-gating the one path that must work.**
+
+        Without this, "no entry" could be satisfied by a gate that is simply
+        always closed — which would ship the feature dead on its own platform.
+        """
+        config = self._build(tmp_path, macos=True, keystone={"enabled": True})
+        assert config["mcpServers"][CU_SERVER]["args"] == [CU_SUBCOMMAND]
+        assert CU_REF in config["tools"]
+
+    def test_a_withheld_server_leaves_no_dangling_ref(self, tmp_path: Path):
+        """``tools`` must not name a server the spec does not define.
+
+        The shipped template grants ``@kirocrew-computer`` unconditionally, so
+        gating the ``mcpServers`` entry alone would leave a ref pointing at
+        nothing — the exact state ``_install_heartbeat_agent`` builds its
+        ``tools`` list from resolved servers to avoid. It is also not cosmetic:
+        kiro-cli mounts a server BECAUSE something references it, so the
+        surviving ref is what would keep spawning the withheld backend.
+        """
+        config = self._build(tmp_path, macos=False, keystone={"enabled": True})
+        assert CU_REF not in config["tools"]
+        assert not [t for t in config["tools"] if t.startswith(f"{CU_REF}/")]
+        assert CU_REF not in config["allowedTools"]
+        # Scoped: the always-on refs the template grants are untouched.
+        assert "@kirocrew-core" in config["tools"]
+
+    def test_an_override_file_cannot_smuggle_the_entry_past_the_gate(self, tmp_path: Path):
+        """A user override naming the server does not defeat a PLATFORM gate.
+
+        ``build_agent_config`` merges the user override file over shipped
+        defaults, so a ``continue`` alone would let an entry arriving from there
+        reach the spec — spawning a backend on an OS where it has no driver.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        override = tmp_path / "override.json"
+        override.write_text(
+            json.dumps({"mcpServers": {CU_SERVER: {"command": "/x", "args": ["y"]}}}),
+            encoding="utf-8",
+        )
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.multiple(
+                    "kiro_crew.agent",
+                    _BUNDLED_CFG_DIR=cfg_dir,
+                    _MANAGED_MCP_SERVERS=self._GATED,
+                )
+            )
+            stack.enter_context(
+                patch("kiro_crew.agent._shipped_defaults", return_value=cfg_dir / "defaults.json")
+            )
+            stack.enter_context(
+                patch("kiro_crew.agent._user_overrides_path", return_value=override)
+            )
+            stack.enter_context(
+                patch("kiro_crew.agent._prompt_path", return_value=cfg_dir / "prompt.md")
+            )
+            stack.enter_context(patch("kiro_crew.agent._project_dir", return_value=None))
+            stack.enter_context(
+                patch("kiro_crew.agent._mc_config_path", return_value=tmp_path / "none.json")
+            )
+            stack.enter_context(patch("kiro_crew.platform_compat.IS_MACOS", False))
+            config = agent.build_agent_config()
+        assert CU_SERVER not in config["mcpServers"]
+
+    def test_a_refresh_RETRACTS_an_entry_written_while_the_gate_was_open(self):
+        """Turning the feature OFF must reclaim the process turning it on started.
+
+        A refresh that only skipped would leave the entry an earlier pass wrote,
+        so the backend would keep being spawned for a disabled feature — the bug,
+        one release later and harder to see.
+        """
+        cfg = {
+            "mcpServers": {
+                CU_SERVER: {"command": "/usr/bin/kirocrew", "args": [CU_SUBCOMMAND]},
+                "kirocrew-core": {"command": "/usr/bin/kirocrew", "args": ["mcp-core"]},
+            },
+            "tools": ["ReadFile", CU_REF, "@kirocrew-core"],
+            "allowedTools": [f"{CU_REF}/computer_get_state"],
+        }
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.multiple("kiro_crew.agent", _MANAGED_MCP_SERVERS=self._GATED)
+            )
+            stack.enter_context(
+                patch("kiro_crew.agent._prompt_path", return_value=Path("/tmp/p.md"))
+            )
+            stack.enter_context(patch("kiro_crew.platform_compat.IS_MACOS", False))
+            agent._refresh_dynamic_fields(cfg)
+        assert CU_SERVER not in cfg["mcpServers"]
+        assert "kirocrew-core" in cfg["mcpServers"]
+        # The refresh path does not own tools/allowedTools; the prune does.
+        assert agent._prune_gated_managed_refs(cfg, frozenset({CU_SERVER})) == [CU_REF]
+        assert CU_REF not in cfg["tools"]
+        assert cfg["allowedTools"] == []
+        assert "ReadFile" in cfg["tools"]
+
+    def test_the_gate_fails_CLOSED_when_the_keystone_cannot_be_read(self, tmp_path: Path):
+        """An unreadable ceiling is never read generously.
+
+        Same posture as ``enable_state.load_state``, and for a stronger reason
+        here: the open position of this gate hands out the operator's whole
+        desktop.
+        """
+        with ExitStack() as stack:
+            stack.enter_context(patch("kiro_crew.platform_compat.IS_MACOS", True))
+            stack.enter_context(
+                patch(
+                    "kiro_crew.computer_use.enable_state.is_enabled",
+                    side_effect=OSError("boom"),
+                )
+            )
+            assert agent._computer_use_spec_gate() is False
+
+    def test_a_gate_that_raises_is_treated_as_closed(self):
+        """``_gated_off_servers`` never lets an exception mean "emit it"."""
+
+        def _explode() -> bool:
+            raise RuntimeError("gate is broken")
+
+        managed = {CU_SERVER: {"invocation_fn": lambda: ("x", []), "spec_gate": _explode}}
+        with patch.multiple("kiro_crew.agent", _MANAGED_MCP_SERVERS=managed):
+            assert agent._gated_off_servers() == frozenset({CU_SERVER})
+
+    def test_only_computer_use_is_gated(self):
+        """The always-on servers carry NO gate.
+
+        A ``spec_gate`` accidentally added to ``kirocrew-core`` would remove the
+        agent's whole first-party tool surface, and the failure would look like a
+        model problem rather than a config one.
+        """
+        gated = {n for n, s in agent._MANAGED_MCP_SERVERS.items() if "spec_gate" in s}
+        assert gated == {CU_SERVER}
+
+    def test_the_shipped_row_gate_is_the_computer_use_predicate(self):
+        """Pinned by identity: a gate is only useful if it is the real one."""
+        assert agent._MANAGED_MCP_SERVERS[CU_SERVER]["spec_gate"] is (
+            agent._computer_use_spec_gate
+        )
+
+    def test_enabling_rebuilds_the_spec_before_resetting_sessions(self):
+        """**The enable path must still work in the session the user is sitting in.**
+
+        The enable is now a spec-emission gate too, so a reset alone would restart
+        every session into the same spec that omits the server — the tools would
+        not appear until the next gateway start. Asserted on ORDER because a
+        rebuild after the reset would restart sessions into the OLD spec and be
+        just as broken.
+        """
+        import inspect
+
+        from kiro_crew.dashboard.handlers import computer_use as handler
+
+        src = inspect.getsource(handler.api_computer_use_config_save)
+        rebuild_at = src.find("rebuild_agent_config")
+        reset_at = src.find("_reset_all_sessions")
+        assert rebuild_at != -1, "the enable flip must rebuild the agent spec"
+        assert reset_at != -1
+        assert rebuild_at < reset_at, "the rebuild must precede the session reset"
+
+    def test_a_malformed_tools_list_is_left_alone(self):
+        """A hand-edited ``tools: {}`` must not fault the whole rebuild.
+
+        The prune runs on a config assembled from files we do not fully control,
+        and a crash here would take down the one function that produces the agent
+        spec at all — a far worse outcome than a surviving ref.
+        """
+        cfg = {"tools": {"not": "a list"}, "allowedTools": None}
+        assert agent._prune_gated_managed_refs(cfg, frozenset({CU_SERVER})) == []
+        assert cfg["tools"] == {"not": "a list"}
+
+    def test_the_WHOLE_install_withholds_the_server_and_audits_the_decision(
+        self, tmp_path: Path
+    ):
+        """**End-to-end through ``install_agent``, which is what actually runs.**
+
+        The per-function tests above prove each half; this one proves the file
+        written to ``~/.kiro/agents`` — after every merge, validation and
+        tools-sync pass — carries neither the entry nor the ref. That is the state
+        kiro-cli reads, and it is the only assertion that would have caught the
+        original bug.
+
+        Staged as an UPGRADE (an existing config holding both the entry and the
+        ref, i.e. what every user who ran a pre-fix build has on disk), because
+        that is the case where the retraction has work to do.
+
+        Also asserts the SEL record: "a managed server was withheld from your
+        agent spec" is an outcome an operator has to be able to see, exactly like
+        the neighbouring ``mcp_auto_approve_withheld`` audit.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        kiro_dir = tmp_path / "kiro_agents"
+        kiro_dir.mkdir(exist_ok=True)
+        (kiro_dir / "kirocrew.json").write_text(
+            json.dumps(
+                {
+                    "model": "claude-user-custom",
+                    "tools": ["ReadFile", CU_REF, "@kirocrew-core"],
+                    "allowedTools": ["ReadFile", f"{CU_REF}/computer_get_state"],
+                    "mcpServers": {
+                        CU_SERVER: {"command": "/usr/bin/kirocrew", "args": [CU_SUBCOMMAND]},
+                        "kirocrew-core": {"command": "/usr/bin/kirocrew", "args": ["mcp-core"]},
+                    },
+                    "hooks": {"preToolUse": "audit"},
+                }
+            )
+        )
+        events: list[dict] = []
+
+        class _Sel:
+            def log_api_access(self, **kw):
+                events.append(kw)
+
+            def __getattr__(self, _name):  # every other SEL call is a no-op here
+                return lambda *a, **k: None
+
+        with ExitStack() as stack:
+            stack.enter_context(patch("kiro_crew.platform_compat.IS_MACOS", False))
+            stack.enter_context(patch("kiro_crew.agent.sel", lambda: _Sel()))
+            path = _run_install(tmp_path, cfg_dir, managed=self._GATED)
+
+        config = _installed(path)
+        assert CU_SERVER not in config["mcpServers"]
+        assert CU_REF not in config["tools"]
+        assert not [t for t in config["allowedTools"] if t.startswith(f"{CU_REF}/")]
+        # The always-on servers still ship — the gate is one row, not a purge.
+        assert "kirocrew-core" in config["mcpServers"]
+        assert "@kirocrew-core" in config["tools"]
+        # And the user's own entries are untouched.
+        assert "ReadFile" in config["tools"]
+
+        withheld = [
+            e
+            for e in events
+            if e.get("operation") == "mcp_server_withheld" and CU_REF in str(e.get("resources"))
+        ]
+        assert withheld, f"no SEL record for the withheld server: {events}"
+
+    def test_a_FRESH_install_audits_the_withheld_server_too(self, tmp_path: Path):
+        """**The audit must not depend on there being a ref left to delete.**
+
+        On a fresh build ``build_agent_config`` has already stripped the ref (the
+        derived agents need a self-consistent spec), so the later prune finds
+        nothing — and an audit derived from that delta would leave the one case
+        where a shipped permission is withheld from a brand-new install with no
+        record at all. The record comes from the gate plus the shipped template
+        instead, so both paths report the same fact.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        events: list[dict] = []
+
+        class _Sel:
+            def log_api_access(self, **kw):
+                events.append(kw)
+
+            def __getattr__(self, _name):
+                return lambda *a, **k: None
+
+        with ExitStack() as stack:
+            stack.enter_context(patch("kiro_crew.platform_compat.IS_MACOS", False))
+            stack.enter_context(patch("kiro_crew.agent.sel", lambda: _Sel()))
+            path = _run_install(tmp_path, cfg_dir, managed=self._GATED)
+
+        assert CU_SERVER not in _installed(path)["mcpServers"]
+        assert [e for e in events if e.get("operation") == "mcp_server_withheld"], (
+            f"a fresh install withheld the server without auditing it: {events}"
+        )
+
+    def test_no_withheld_audit_when_the_template_never_granted_it(self, tmp_path: Path):
+        """An edition that ships without computer use has nothing to report.
+
+        The record says "a grant the template makes was withheld"; with no grant
+        there is no removal, and a per-rebuild event about a server the user was
+        never offered is noise an auditor has to learn to ignore.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        defaults_path = cfg_dir / "defaults.json"
+        defaults = json.loads(defaults_path.read_text(encoding="utf-8"))
+        defaults["tools"] = [t for t in defaults["tools"] if t != CU_REF]
+        defaults_path.write_text(json.dumps(defaults))
+        events: list[dict] = []
+
+        class _Sel:
+            def log_api_access(self, **kw):
+                events.append(kw)
+
+            def __getattr__(self, _name):
+                return lambda *a, **k: None
+
+        with ExitStack() as stack:
+            stack.enter_context(patch("kiro_crew.platform_compat.IS_MACOS", False))
+            stack.enter_context(patch("kiro_crew.agent.sel", lambda: _Sel()))
+            _run_install(tmp_path, cfg_dir, managed=self._GATED)
+
+        assert [e for e in events if e.get("operation") == "mcp_server_withheld"] == []
 
 
 # ── The data-home pin ──

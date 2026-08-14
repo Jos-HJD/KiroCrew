@@ -250,6 +250,22 @@ class DiscordDispatcher:
         # the turn: a resumed dashboard session is not this conversation's own
         # session, and several steps below must not treat it as one.
         resumed_key = self._session_resume.resumed_session(channel_id)
+        # A conversation that HELD an inbound binding never falls back in silence.
+        # The binding can be destroyed with no action from the user — an overflow
+        # recycle, a restart prune, a dashboard mirror unlink — and without this
+        # the next message runs in their own session as if they had never
+        # attached, answered by an agent holding none of the context they can see
+        # above it. Refusing once is honest and recoverable, the same trade the
+        # busy path below makes.
+        detached_title = await self._session_resume.note_binding(channel_id, resumed_key)
+        if detached_title is not None:
+            await self.client.send_message(
+                channel_id,
+                f'🔗 Detached: this conversation is no longer linked to "{detached_title}". '
+                "Your message was NOT processed. Run `!sessions` to reattach, or "
+                "resend to continue in your own conversation.",
+            )
+            return
         session_key = resumed_key or self._session_key(user_id, thread_id)
         if self.sessions.is_busy(session_key):
             if resumed_key is not None:

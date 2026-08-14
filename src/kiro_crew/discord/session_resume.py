@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from kiro_crew.discord.resume_expectation import ResumeExpectations
 from kiro_crew.history import is_incognito_transcript
 from kiro_crew.messaging.driver import sanitize_channel_replay_text
 from kiro_crew.messaging.link import ChannelLink
@@ -31,6 +32,9 @@ _PICKER_TTL_SECS = 300
 _PICKER_REGISTRY_MAX = 100
 _REPLAY_MESSAGES = 5
 _REPLAY_TEXT_LIMIT = 1900
+#: Matches the picker's own label budget, so the title a detach notice names is
+#: the same string the user picked.
+_TITLE_LIMIT = 76
 
 
 @dataclass(frozen=True)
@@ -110,6 +114,10 @@ class DiscordSessionResume:
         # refresh slots, which is exactly the window the chip exists to cover.
         self.dashboard_state: object | None = None
         self._bind_lock = asyncio.Lock()
+        # Survives the bound session's map entry, which is what makes a
+        # binding destroyed out-of-band reportable at all -- see
+        # discord/resume_expectation.py.
+        self._expectations = ResumeExpectations()
 
     def _push_slots(self) -> None:
         """Nudge the dashboard so the two-way chip appears/disappears at once."""
@@ -147,6 +155,12 @@ class DiscordSessionResume:
 
     def leave_resumed_session(self, channel_id: str) -> str | None:
         key = self.resumed_session(channel_id)
+        # Unconditional, and ahead of the key check: this is the user asking to
+        # be back in their own conversation (`!unlink`, `!new`), so any
+        # expectation left over from an earlier attach is stale and must not
+        # surface a detach notice later. It also covers the `!unlink` path that
+        # falls through to releasing an outbound mirror, which runs after this.
+        self._expectations.clear(channel_id)
         if key is not None:
             # Free the LOCATION, not just the resume binding: a session map can
             # hold co-located bindings — one written before conversations became
@@ -163,6 +177,44 @@ class DiscordSessionResume:
             )
             self._push_slots()
         return key
+
+    async def note_binding(self, channel_id: str, resumed_key: str | None) -> str | None:
+        """Reconcile the recorded expectation against what the resolver just found.
+
+        Returns the title of a binding that VANISHED — the one outcome the user
+        has to hear about before their message runs somewhere else — and ``None``
+        in every other case.
+
+        A conversation that resolves a DIFFERENT session has been legitimately
+        rebound (a dashboard connect, or a fresh pick here), so the record is
+        refreshed in silence. A vanished binding is reported once and the record
+        consumed: the user's next message is meant to continue in their own
+        conversation, and repeating the refusal would strand them there.
+        """
+        expected = self._expectations.get(channel_id)
+        if expected is None:
+            return None
+        if resumed_key is not None:
+            if resumed_key != expected.key:
+                title = await self._title_of(resumed_key)
+                self._expectations.record(channel_id, resumed_key, title)
+            return None
+        self._expectations.clear(channel_id)
+        # Redacted and mention-neutered at the point of emission: a title read
+        # back from the store or from history is conversation text, and only the
+        # picker's own titles arrive already sanitized.
+        return _safe_discord_text(expected.title or expected.key, _TITLE_LIMIT)
+
+    async def _title_of(self, session_key: str) -> str:
+        """The stored title for *session_key*, read off-loop; ``""`` when unavailable."""
+        if self.conv_log is None:
+            return ""
+        try:
+            meta = await asyncio.to_thread(self.conv_log.get_metadata, session_key)
+        except Exception:
+            logger.debug("discord resume: title lookup for rebind failed", exc_info=True)
+            return ""
+        return str((meta or {}).get("title") or "")
 
     async def show_picker(
         self,
@@ -449,6 +501,13 @@ class DiscordSessionResume:
                     choice.key,
                     target,
                     accepts_inbound=True,
+                )
+                # Recorded under the bind lock, so the store cannot end up naming
+                # an older pick than the binding it describes.
+                self._expectations.record(
+                    interaction.channel_id,
+                    choice.key,
+                    choice.title,
                 )
                 self._push_slots()
             except ConversationOwnershipConflict:

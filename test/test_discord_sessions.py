@@ -15,6 +15,17 @@ from kiro_crew.session import _opt_out_key
 from kiro_crew.session_map import ConversationOwnershipConflict
 
 
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, monkeypatch):
+    """Point the resume-expectation store at a per-test data home.
+
+    The dispatcher reads the store on every inbound message and writes it on
+    every attach, so without this the suite would read — and a bind test would
+    write — the developer's live ``~/.kiro/crew``.
+    """
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+
+
 class _Client:
     def __init__(self) -> None:
         self.sent: list[tuple[str, Any]] = []
@@ -1267,3 +1278,102 @@ class TestDashboardConnectedConversationResumes:
         # Must not raise.
         sessions.set_mirror_link("dashboard:chat-2", loc)
         assert sessions.find_mirror_sessions(loc, inbound_only=True) == []
+
+
+class TestBindingLostUnderTheConversation:
+    """A binding destroyed out-of-band must not route the next message silently.
+
+    ``!sessions`` attaches a dashboard session to this conversation, and the
+    binding lives on that session's map entry. An overflow recycle, a restart
+    prune or a dashboard mirror unlink destroys the entry — so the inbound
+    resolver finds no owner and the dispatcher falls back to the DM's own
+    session. Nothing was said, so the user keeps typing into what looks like the
+    resumed conversation and is answered by an agent that never saw it.
+    """
+
+    @staticmethod
+    async def _attach(dispatcher: DiscordDispatcher, client: _Client) -> ChannelLink:
+        """Resume a session the way a user does — through the picker."""
+        await dispatcher.handle_message(_message("!sessions"))
+        custom_id, message_id = _picker_button(client)
+        await dispatcher.on_interaction(_interaction(custom_id, message_id))
+        return ChannelLink(channel_type="discord", channel_id="c1")
+
+    @pytest.mark.asyncio
+    async def test_a_vanished_binding_is_reported_and_the_turn_refused(self) -> None:
+        dispatcher, client, sessions = _dispatcher({"u1"}, _log("Launch plan"))
+        link = await self._attach(dispatcher, client)
+        assert dispatcher._session_resume.resumed_session("c1") == "dashboard:chat-1"
+        # What a recycle / prune / dashboard unlink leaves behind: the binding is
+        # gone and the conversation resolves no owner at all.
+        sessions.clear_mirror_links_at(link)
+        sessions.last_key = ""
+
+        await dispatcher.handle_message(_message("what did we decide?"))
+
+        assert "Detached" in client.sent[-1][0]
+        assert "Launch plan" in client.sent[-1][0]
+        assert sessions.last_key == "", "the refused message still ran a turn"
+
+    @pytest.mark.asyncio
+    async def test_the_following_message_runs_in_the_users_own_conversation(self) -> None:
+        """Refuse ONCE. A second refusal would strand the user with no way on."""
+        dispatcher, client, sessions = _dispatcher({"u1"}, _log("Launch plan"))
+        link = await self._attach(dispatcher, client)
+        sessions.clear_mirror_links_at(link)
+        await dispatcher.handle_message(_message("what did we decide?"))
+        notices = len([text for text, _ in client.sent if "Detached" in text])
+
+        await dispatcher.handle_message(_message("resending this"))
+
+        assert len([text for text, _ in client.sent if "Detached" in text]) == notices
+        assert sessions.last_key == dispatcher._session_key("u1")
+
+    @pytest.mark.asyncio
+    async def test_unlink_leaves_nothing_to_report(self) -> None:
+        """The user asked to leave, so a later message is not a surprise."""
+        dispatcher, client, sessions = _dispatcher({"u1"}, _log("Launch plan"))
+        await self._attach(dispatcher, client)
+
+        await dispatcher.handle_message(_message("!unlink"))
+        await dispatcher.handle_message(_message("hello"))
+
+        assert not any("Detached" in text for text, _ in client.sent)
+        assert sessions.last_key == dispatcher._session_key("u1")
+
+    @pytest.mark.asyncio
+    async def test_a_rebind_elsewhere_is_not_a_detach(self) -> None:
+        """A different owner is a legitimate rebind — refresh the record, say nothing."""
+        log = _log_with_titles("Launch plan", "Pricing review")
+        dispatcher, client, sessions = _dispatcher({"u1"}, log)
+        link = await self._attach(dispatcher, client)
+        # What a dashboard connect writes over an existing attach.
+        sessions.clear_mirror_links_at(link)
+        sessions.set_mirror_link("dashboard:chat-1", link, accepts_inbound=True)
+
+        await dispatcher.handle_message(_message("carry on"))
+
+        assert not any("Detached" in text for text, _ in client.sent)
+        assert sessions.last_key == "dashboard:chat-1"
+        # The record now names the session actually bound, so losing THAT one
+        # reports the right conversation rather than the superseded pick.
+        assert dispatcher._session_resume._expectations.get("c1") is not None
+        assert dispatcher._session_resume._expectations.get("c1").key == "dashboard:chat-1"
+
+    @pytest.mark.asyncio
+    async def test_a_restart_can_still_name_what_was_lost(self) -> None:
+        """Why the record is not kept on the bound session's map entry.
+
+        A restart prune is one of the ways the binding disappears, so a record
+        held only in memory would be gone exactly when it is needed. A second
+        dispatcher over the same data home stands in for the restarted gateway.
+        """
+        dispatcher, client, sessions = _dispatcher({"u1"}, _log("Launch plan"))
+        link = await self._attach(dispatcher, client)
+        sessions.clear_mirror_links_at(link)
+
+        restarted, restarted_client, restarted_sessions = _dispatcher({"u1"}, _log())
+        await restarted.handle_message(_message("what did we decide?"))
+
+        assert "Launch plan" in restarted_client.sent[-1][0]
+        assert restarted_sessions.last_key == ""
